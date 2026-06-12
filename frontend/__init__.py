@@ -1,0 +1,1 @@
+# CharacterSeed Frontend Package
