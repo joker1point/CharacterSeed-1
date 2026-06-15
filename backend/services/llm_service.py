@@ -4,14 +4,31 @@ from backend.config import settings
 from typing import Optional
 
 class LLMService:
-    """LLM服务封装类"""
+    """LLM服务封装类 - 支持多模型切换
+    
+    支持的模型厂商:
+    - deepseek: DeepSeek API
+    - qwen: 通义千问 (阿里云)
+    - zhipu: 智谱 GLM
+    - ollama: 本地 Ollama
+    - openai: OpenAI GPT
+    
+    使用方式:
+    在 .env 文件中设置 LLM_PROVIDER=厂商名，并配置对应的 API_KEY
+    """
     
     def __init__(self):
+        llm_config = settings.get_llm_config()
+        
+        if not llm_config["api_key"] and settings.LLM_PROVIDER != "ollama":
+            raise ValueError(f"{settings.LLM_PROVIDER.upper()}_API_KEY 未配置，请检查 .env 文件")
+        
         self.client = OpenAI(
-            api_key=settings.DEEPSEEK_API_KEY,
-            base_url=settings.DEEPSEEK_BASE_URL
+            api_key=llm_config["api_key"],
+            base_url=llm_config["base_url"]
         )
-        self.model = "deepseek-chat"  # DeepSeek-V3模型
+        self.model = llm_config["model"]
+        self.provider = settings.LLM_PROVIDER
     
     def call(
         self,
