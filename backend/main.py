@@ -17,6 +17,8 @@ from backend.crud import growth as growth_crud
 from backend.modules.creation import CreationModule
 from backend.modules.interaction import InteractionPipeline
 from backend.modules.growth import GrowthModule
+from backend.modules.enhanced_interaction import EnhancedInteractionPipeline
+from backend.api.memory_router import router as memory_router
 
 # 创建数据库表
 Base.metadata.create_all(bind=engine)
@@ -36,6 +38,13 @@ def startup_event():
     print("CharacterSeed API 启动成功！")
     print("访问 http://localhost:8000/docs 查看API文档")
     print("=" * 50)
+
+# ==================== 注册记忆系统路由 ====================
+app.include_router(memory_router)
+
+# ==================== 全局实例 ====================
+# 增强版管线（集成三层记忆）
+enhanced_pipeline = EnhancedInteractionPipeline(enable_memory=True)
 
 # ==================== Character Endpoints ====================
 
@@ -144,6 +153,40 @@ def chat(request: ChatRequest, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"对话处理失败: {str(e)}")
+
+
+@app.post("/api/chat/enhanced", response_model=ChatResponse)
+def chat_enhanced(
+    request: ChatRequest,
+    user_id: Optional[str] = None,
+    db: Session = Depends(get_db)
+):
+    """
+    与角色对话（增强版 - 集成三层记忆系统）
+
+    在基础管线之上：
+    - 自动维护短期记忆（LangChain Window）
+    - 自动记录长期记忆（Mem0）
+    - 自动检索相关知识（Cognee RAG）
+    - 返回响应中包含 memory_stats 字段
+
+    Args:
+        request: 包含 character_id 和 message
+        user_id: 用户 ID（可选，用于多用户隔离）
+    """
+    try:
+        # 使用全局增强管线实例
+        result = enhanced_pipeline.run(
+            character_id=request.character_id,
+            user_message=request.message,
+            db=db,
+            user_id=user_id
+        )
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"增强对话失败: {str(e)}")
 
 # ==================== Growth Endpoints（Day 3实现） ====================
 
