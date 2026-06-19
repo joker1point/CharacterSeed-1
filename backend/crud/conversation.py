@@ -26,7 +26,8 @@ def create_conversation(
     action: Optional[str] = None,
     expression: Optional[str] = None,
     director_raw: Optional[str] = None,
-    actor_raw: Optional[str] = None
+    actor_raw: Optional[str] = None,
+    session_id: Optional[int] = None,
 ):
     """创建对话记录"""
     db_conversation = Conversation(
@@ -37,12 +38,28 @@ def create_conversation(
         action=action,
         expression=expression,
         director_raw=director_raw,
-        actor_raw=actor_raw
+        actor_raw=actor_raw,
+        session_id=session_id,
     )
     db.add(db_conversation)
     db.commit()
     db.refresh(db_conversation)
     return db_conversation
+
+
+def get_session_conversations(
+    db: Session,
+    session_id: int,
+    limit: int = 200,
+) -> List[Conversation]:
+    """获取某个 session 的全部对话（按时间升序）"""
+    return (
+        db.query(Conversation)
+        .filter(Conversation.session_id == session_id)
+        .order_by(Conversation.timestamp.asc())
+        .limit(limit)
+        .all()
+    )
 
 def delete_conversation(db: Session, conversation_id: int):
     """删除对话"""
