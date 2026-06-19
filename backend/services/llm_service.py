@@ -14,14 +14,14 @@ logger = logging.getLogger(__name__)
 
 class LLMService:
     """LLM服务封装类 - 支持多模型切换
-    
+
     支持的模型厂商:
     - deepseek: DeepSeek API
     - qwen: 通义千问 (阿里云)
     - zhipu: 智谱 GLM
     - ollama: 本地 Ollama
     - openai: OpenAI GPT
-    
+
     使用方式:
     在 .env 文件中设置 LLM_PROVIDER=厂商名，并配置对应的 API_KEY
     """
@@ -72,7 +72,7 @@ class LLMService:
     ) -> str:
         """
         调用LLM
-        
+
         Args:
             prompt: 用户prompt
             system_prompt: 系统prompt（可选）
@@ -80,7 +80,7 @@ class LLMService:
             max_tokens: 最大token数
             response_format: 响应格式约束（可选，例如 {"type": "json_object"}）。
                            默认 None 即不约束格式，由调用方按需传入。
-            
+
         Returns:
             LLM的响应文本
         """
@@ -204,10 +204,10 @@ class LLMService:
     def parse_json_response(self, response: str) -> dict:
         """
         解析LLM的JSON响应
-        
+
         Args:
             response: LLM返回的字符串
-            
+
         Returns:
             解析后的字典
         """
@@ -232,19 +232,19 @@ class LLMService:
     def validate_creation_schema(data: dict) -> dict:
         """
         轻量级 schema 校验：验证 Creation LLM 输出的必要字段与类型。
-        
+
         校验内容：
         1. 顶层必填字段：name, world_setting, personality, current_state
         2. personality 子字段：optimism, courage, empathy, loyalty,
            intelligence, sociability（要求为 0-100 整数值）
         3. current_state 子字段：location, activity, mood
-        
+
         Args:
             data: 解析后的字典
-            
+
         Returns:
             校验通过后的字典（personality 数值已转为 int）
-            
+
         Raises:
             ValueError: 缺少必要字段或类型错误时
         """
