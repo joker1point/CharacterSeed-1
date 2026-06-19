@@ -169,26 +169,52 @@ class LongTermMemory:
         else:
             return self._search_fallback(query, limit)
     
+    def _tokenize(self, text: str) -> List[str]:
+        """
+        文本分词：支持中文按字切分 + 英文按词切分
+        - 英文/数字按空格和标点分词
+        - 中文按 1-2 字滑窗切分（兼容中英混合）
+        """
+        import re
+        text = text.lower().strip()
+        # 提取所有连续中文片段
+        tokens = []
+        # 1) 英文/数字 token
+        en_tokens = re.findall(r"[a-z0-9]+", text)
+        tokens.extend(en_tokens)
+        # 2) 中文字符 1-gram 和 2-gram
+        cn_chars = re.findall(r"[\u4e00-\u9fff]", text)
+        tokens.extend(cn_chars)
+        for i in range(len(cn_chars) - 1):
+            tokens.append(cn_chars[i] + cn_chars[i + 1])
+        return tokens
+
     def _search_fallback(self, query: str, limit: int) -> List[Dict[str, Any]]:
         """
-        降级方案：简单的关键词匹配
-        （生产环境应使用向量检索）
+        降级方案：基于分词的关键词匹配
+        支持中文按字 + 英文按词的混合匹配
         """
         with open(self._fallback_file, "r", encoding="utf-8") as f:
             data = json.load(f)
-        
-        # 简单关键词匹配（仅作为降级方案）
-        query_words = set(query.lower().split())
+
+        query_tokens = set(self._tokenize(query))
+        if not query_tokens:
+            return []
+
         scored_memories = []
         for mem in data["memories"]:
-            content_words = set(mem["content"].lower().split())
-            overlap = len(query_words & content_words)
+            content_tokens = set(self._tokenize(mem["content"]))
+            if not content_tokens:
+                continue
+            overlap = len(query_tokens & content_tokens)
             if overlap > 0:
+                # Jaccard 相似度，避免短查询分母过小
+                score = overlap / len(query_tokens | content_tokens)
                 scored_memories.append({
                     **mem,
-                    "score": overlap / len(query_words)
+                    "score": round(score, 4)
                 })
-        
+
         scored_memories.sort(key=lambda x: x["score"], reverse=True)
         return scored_memories[:limit]
     

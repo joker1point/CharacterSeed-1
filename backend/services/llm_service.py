@@ -1,7 +1,16 @@
 import json
-from openai import OpenAI
+import logging
+import re
+import time
+from typing import Optional, Dict, Any
+from urllib.parse import urlparse
+
+from openai import OpenAI, APIError, APIConnectionError, RateLimitError, AuthenticationError
+
 from backend.config import settings
-from typing import Optional
+
+logger = logging.getLogger(__name__)
+
 
 class LLMService:
     """LLM服务封装类 - 支持多模型切换
@@ -16,20 +25,43 @@ class LLMService:
     使用方式:
     在 .env 文件中设置 LLM_PROVIDER=厂商名，并配置对应的 API_KEY
     """
-    
+
+    _MAX_RETRIES = 3
+    _RETRY_DELAY = 1.0
+    _TIMEOUT = 60
+
     def __init__(self):
         llm_config = settings.get_llm_config()
-        
+
         if not llm_config["api_key"] and settings.LLM_PROVIDER != "ollama":
             raise ValueError(f"{settings.LLM_PROVIDER.upper()}_API_KEY 未配置，请检查 .env 文件")
-        
+
+        self._validate_base_url(llm_config["base_url"])
+
         self.client = OpenAI(
             api_key=llm_config["api_key"],
-            base_url=llm_config["base_url"]
+            base_url=llm_config["base_url"],
+            timeout=self._TIMEOUT
         )
         self.model = llm_config["model"]
         self.provider = settings.LLM_PROVIDER
-    
+
+        logger.info(f"LLMService initialized: provider={self.provider}, model={self.model}")
+
+    def _validate_base_url(self, base_url: str) -> None:
+        """校验 base_url 格式合法性"""
+        if not base_url:
+            raise ValueError("base_url 不能为空")
+
+        try:
+            parsed = urlparse(base_url)
+            if not parsed.scheme or parsed.scheme not in ("http", "https"):
+                raise ValueError("base_url 必须以 http:// 或 https:// 开头")
+            if not parsed.netloc:
+                raise ValueError("base_url 缺少有效的域名或IP地址")
+        except ValueError as e:
+            raise ValueError(f"base_url 格式错误: {e}")
+
     def call(
         self,
         prompt: str,
@@ -52,32 +84,123 @@ class LLMService:
         Returns:
             LLM的响应文本
         """
+        self._validate_call_params(prompt, system_prompt, temperature, max_tokens)
+
         messages = []
-        
+
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
-        
+
         messages.append({"role": "user", "content": prompt})
-        
-        try:
-            kwargs = dict(
-                model=self.model,
-                messages=messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-            )
-            if response_format is not None:
-                kwargs["response_format"] = response_format
-            
-            response = self.client.chat.completions.create(**kwargs)
-            
-            content = response.choices[0].message.content
-            return content
-            
-        except Exception as e:
-            print(f"LLM调用失败: {e}")
-            raise
-    
+
+        kwargs = dict(
+            model=self.model,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        if response_format is not None:
+            kwargs["response_format"] = response_format
+
+        last_exception = None
+        for attempt in range(self._MAX_RETRIES):
+            try:
+                response = self.client.chat.completions.create(**kwargs)
+                return self._extract_content(response)
+
+            except AuthenticationError as e:
+                logger.error(f"LLM认证失败: {str(e)[:200]}")
+                raise
+
+            except RateLimitError as e:
+                logger.warning(f"LLM限流: attempt={attempt+1}/{self._MAX_RETRIES}, {str(e)[:200]}")
+                if attempt < self._MAX_RETRIES - 1:
+                    time.sleep(self._RETRY_DELAY * (attempt + 1))
+                    continue
+                last_exception = e
+
+            except APIConnectionError as e:
+                logger.warning(f"LLM连接失败: attempt={attempt+1}/{self._MAX_RETRIES}, {str(e)[:200]}")
+                if attempt < self._MAX_RETRIES - 1:
+                    time.sleep(self._RETRY_DELAY * (attempt + 1))
+                    continue
+                last_exception = e
+
+            except APIError as e:
+                logger.error(f"LLM API错误: attempt={attempt+1}/{self._MAX_RETRIES}, {str(e)[:200]}")
+                if attempt < self._MAX_RETRIES - 1:
+                    time.sleep(self._RETRY_DELAY * (attempt + 1))
+                    continue
+                last_exception = e
+
+            except Exception as e:
+                logger.error(f"LLM调用未知错误: {str(e)[:200]}")
+                raise
+
+        if last_exception:
+            raise last_exception
+
+    def _validate_call_params(
+        self,
+        prompt: str,
+        system_prompt: Optional[str],
+        temperature: float,
+        max_tokens: int
+    ) -> None:
+        """校验调用参数合法性"""
+        if not prompt or not isinstance(prompt, str) or not prompt.strip():
+            raise ValueError("prompt 必须是非空字符串")
+
+        if system_prompt is not None:
+            if not isinstance(system_prompt, str):
+                raise ValueError("system_prompt 必须是字符串")
+            if not system_prompt.strip():
+                system_prompt = None
+
+        if not isinstance(temperature, (int, float)):
+            raise ValueError("temperature 必须是数值")
+        if temperature < 0 or temperature > 2:
+            raise ValueError("temperature 必须在 [0, 2] 范围内")
+
+        if not isinstance(max_tokens, int):
+            raise ValueError("max_tokens 必须是整数")
+        if max_tokens < 1 or max_tokens > 32000:
+            raise ValueError("max_tokens 必须在 [1, 32000] 范围内")
+
+    def _extract_content(self, response: Any) -> str:
+        """安全提取响应内容"""
+        if not response:
+            logger.warning("LLM返回空响应")
+            return ""
+
+        if not hasattr(response, "choices") or not response.choices:
+            logger.warning("LLM返回空choices")
+            return ""
+
+        first_choice = response.choices[0]
+        if not first_choice:
+            logger.warning("LLM第一个choice为空")
+            return ""
+
+        message = getattr(first_choice, "message", None)
+        if not message:
+            logger.warning("LLM响应中message为空")
+            return ""
+
+        content = getattr(message, "content", None)
+        if content is None:
+            logger.warning("LLM响应content为None")
+            return ""
+
+        if not isinstance(content, str):
+            logger.warning(f"LLM响应content类型异常: {type(content)}")
+            try:
+                return str(content)
+            except Exception:
+                return ""
+
+        return content.strip()
+
     def parse_json_response(self, response: str) -> dict:
         """
         解析LLM的JSON响应
@@ -88,17 +211,22 @@ class LLMService:
         Returns:
             解析后的字典
         """
+        if not response or not isinstance(response, str) or not response.strip():
+            raise ValueError("响应为空，无法解析JSON")
+
         try:
-            # 尝试直接解析
-            return json.loads(response)
+            return json.loads(response.strip())
         except json.JSONDecodeError:
-            # 如果失败，尝试提取JSON部分
-            import re
-            json_match = re.search(r'\{.*\}', response, re.DOTALL)
+            pass
+
+        try:
+            json_match = re.search(r'\{[^}]*\}', response, re.DOTALL)
             if json_match:
                 return json.loads(json_match.group())
-            else:
-                raise ValueError(f"无法解析LLM响应为JSON: {response}")
+        except (json.JSONDecodeError, re.error):
+            pass
+
+        raise ValueError(f"无法解析LLM响应为JSON: {response[:200]}...")
 
     @staticmethod
     def validate_creation_schema(data: dict) -> dict:
@@ -120,13 +248,14 @@ class LLMService:
         Raises:
             ValueError: 缺少必要字段或类型错误时
         """
-        # 1. 顶层必填字段
+        if not isinstance(data, dict):
+            raise ValueError("数据必须是字典")
+
         required_top = ["name", "world_setting", "personality", "current_state"]
         for field in required_top:
             if field not in data or data[field] is None:
                 raise ValueError(f"LLM响应缺少必填字段: '{field}'")
 
-        # 2. personality 子字段校验 + 类型强制转换
         personality = data["personality"]
         if not isinstance(personality, dict):
             raise ValueError("'personality' 必须是 JSON 对象")
@@ -141,23 +270,20 @@ class LLMService:
             try:
                 val = int(personality[field])
                 if val < 0 or val > 100:
-                    raise ValueError(
-                        f"personality.{field} 值 {val} 超出范围 [0, 100]"
-                    )
+                    val = max(0, min(100, val))
                 personality[field] = val
             except (ValueError, TypeError):
-                raise ValueError(
-                    f"personality.{field} 值 '{personality[field]}' 无法转换为 0-100 的整数"
-                )
+                personality[field] = 50
 
-        # 3. current_state 子字段校验
         current_state = data["current_state"]
         if not isinstance(current_state, dict):
             raise ValueError("'current_state' 必须是 JSON 对象")
 
         for field in ["location", "activity", "mood"]:
             if field not in current_state:
-                raise ValueError(f"current_state 缺少字段: '{field}'")
+                current_state[field] = ""
+            elif not isinstance(current_state[field], str):
+                current_state[field] = str(current_state[field])
 
         return data
 
@@ -184,36 +310,45 @@ class LLMService:
         Raises:
             ValueError: 缺少必要字段或类型错误时
         """
-        # 1. 顶层必填字段
-        required_top = ["emotion", "focus_memories", "goal", "style"]
-        for field in required_top:
-            if field not in data or data[field] is None:
-                raise ValueError(f"Director 输出缺少必填字段: '{field}'")
+        if not isinstance(data, dict):
+            raise ValueError("数据必须是字典")
 
-        # 2. emotion - 非空字符串
+        defaults = {
+            "emotion": "neutral",
+            "focus_memories": [],
+            "goal": "继续对话",
+            "style": "natural"
+        }
+
+        for field, default in defaults.items():
+            if field not in data or data[field] is None:
+                data[field] = default
+
         emotion = data["emotion"]
         if not isinstance(emotion, str) or not emotion.strip():
-            raise ValueError(f"Director.emotion 必须是非空字符串")
+            data["emotion"] = "neutral"
+        else:
+            data["emotion"] = emotion.strip()
 
-        # 3. focus_memories - 必须为列表，元素为字符串，截断到 3 条
         focus_memories = data["focus_memories"]
         if not isinstance(focus_memories, list):
-            raise ValueError(f"Director.focus_memories 必须是数组")
-        # 过滤非字符串元素 + 去空 + 截断
-        focus_memories = [
-            str(m) for m in focus_memories if m and str(m).strip()
-        ][:3]
-        data["focus_memories"] = focus_memories
+            data["focus_memories"] = []
+        else:
+            data["focus_memories"] = [
+                str(m).strip() for m in focus_memories if m and str(m).strip()
+            ][:3]
 
-        # 4. goal - 非空字符串
         goal = data["goal"]
         if not isinstance(goal, str) or not goal.strip():
-            raise ValueError(f"Director.goal 必须是非空字符串")
+            data["goal"] = "继续对话"
+        else:
+            data["goal"] = goal.strip()
 
-        # 5. style - 非空字符串
         style = data["style"]
         if not isinstance(style, str) or not style.strip():
-            raise ValueError(f"Director.style 必须是非空字符串")
+            data["style"] = "natural"
+        else:
+            data["style"] = style.strip()
 
         return data
 
@@ -240,25 +375,25 @@ class LLMService:
         Raises:
             ValueError: 缺少必要字段或类型错误时
         """
-        required_top = ["action", "expression", "speech"]
-        for field in required_top:
+        if not isinstance(data, dict):
+            raise ValueError("数据必须是字典")
+
+        defaults = {
+            "action": "stand",
+            "expression": "neutral",
+            "speech": "..."
+        }
+
+        for field, default in defaults.items():
             if field not in data or data[field] is None:
-                raise ValueError(f"Actor 输出缺少必填字段: '{field}'")
+                data[field] = default
 
-        # action - 非空字符串
-        action = data["action"]
-        if not isinstance(action, str) or not action.strip():
-            raise ValueError(f"Actor.action 必须是非空字符串")
-
-        # expression - 非空字符串
-        expression = data["expression"]
-        if not isinstance(expression, str) or not expression.strip():
-            raise ValueError(f"Actor.expression 必须是非空字符串")
-
-        # speech - 非空字符串
-        speech = data["speech"]
-        if not isinstance(speech, str) or not speech.strip():
-            raise ValueError(f"Actor.speech 必须是非空字符串")
+        for field in ["action", "expression", "speech"]:
+            value = data[field]
+            if not isinstance(value, str):
+                data[field] = str(value) if value else defaults[field]
+            if not data[field].strip():
+                data[field] = defaults[field]
 
         return data
 
@@ -287,17 +422,15 @@ class LLMService:
         Raises:
             ValueError: 缺少必要字段或类型/范围错误时
         """
-        # 1. 顶层必填字段
-        required_top = ["personality_delta", "new_memories", "event_summary"]
-        for field in required_top:
-            if field not in data or data[field] is None:
-                raise ValueError(f"Growth 输出缺少必填字段: '{field}'")
+        if not isinstance(data, dict):
+            raise ValueError("数据必须是字典")
 
-        # 2. personality_delta 子字段校验
-        #    只有 6 个固定的人格维度，不变属性名
+        if "personality_delta" not in data or data["personality_delta"] is None:
+            data["personality_delta"] = {}
         personality_delta = data["personality_delta"]
         if not isinstance(personality_delta, dict):
-            raise ValueError("'personality_delta' 必须是 JSON 对象")
+            data["personality_delta"] = {}
+            personality_delta = {}
 
         personality_fields = [
             "optimism", "courage", "empathy",
@@ -305,42 +438,32 @@ class LLMService:
         ]
         for field in personality_fields:
             if field not in personality_delta:
-                raise ValueError(
-                    f"personality_delta 缺少字段: '{field}'"
-                )
-            try:
-                val = int(personality_delta[field])
-                # 限制变化范围在 [-30, 30]，防止 LLM 输出极端值
-                if val < -30 or val > 30:
-                    raise ValueError(
-                        f"personality_delta.{field} 值 {val} "
-                        f"超出范围 [-30, 30]"
-                    )
-                personality_delta[field] = val
-            except (ValueError, TypeError):
-                raise ValueError(
-                    f"personality_delta.{field} 值 "
-                    f"'{personality_delta[field]}' 无法转换为整数"
-                )
+                personality_delta[field] = 0
+            else:
+                try:
+                    val = int(personality_delta[field])
+                    val = max(-30, min(30, val))
+                    personality_delta[field] = val
+                except (ValueError, TypeError):
+                    personality_delta[field] = 0
 
-        # 3. new_memories 数组校验
+        if "new_memories" not in data or data["new_memories"] is None:
+            data["new_memories"] = []
         new_memories = data["new_memories"]
         if not isinstance(new_memories, list):
-            raise ValueError("'new_memories' 必须是数组")
+            data["new_memories"] = []
+            new_memories = []
 
         validated_memories = []
-        for i, mem in enumerate(new_memories):
+        for mem in new_memories:
             if not isinstance(mem, dict):
                 continue
-            # content 必须是非空字符串
             content = mem.get("content", "")
             if not isinstance(content, str) or not content.strip():
                 continue
-            # importance 必须在 1-10 范围内
             try:
                 importance = int(mem.get("importance", 5))
-                if importance < 1 or importance > 10:
-                    importance = 5  # 范围外则回退到默认值
+                importance = max(1, min(10, importance))
             except (ValueError, TypeError):
                 importance = 5
             validated_memories.append({
@@ -348,12 +471,13 @@ class LLMService:
                 "importance": importance
             })
 
-        # 截断到最多 3 条（prompt 已要求 ≤3，此处为兜底）
         data["new_memories"] = validated_memories[:3]
 
-        # 4. event_summary 非空字符串
-        event_summary = data["event_summary"]
-        if not isinstance(event_summary, str) or not event_summary.strip():
-            raise ValueError("'event_summary' 必须是非空字符串")
+        if "event_summary" not in data or data["event_summary"] is None:
+            data["event_summary"] = "角色经历了一次成长"
+        else:
+            event_summary = data["event_summary"]
+            if not isinstance(event_summary, str) or not event_summary.strip():
+                data["event_summary"] = "角色经历了一次成长"
 
         return data

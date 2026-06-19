@@ -1,9 +1,15 @@
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing import Optional, Literal
 
 class Settings(BaseSettings):
-    # LLM Provider Selection: deepseek | qwen | zhipu | ollama | openai
-    LLM_PROVIDER: str = "deepseek"
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        case_sensitive=True,
+        extra="ignore"  # 允许 .env 中存在未声明字段
+    )
+
+    # LLM Provider Selection: deepseek | qwen | zhipu | ollama | openai | agnes
+    LLM_PROVIDER: str = "agnes"
     
     # DeepSeek API Configuration
     DEEPSEEK_API_KEY: str = ""
@@ -28,7 +34,12 @@ class Settings(BaseSettings):
     OPENAI_API_KEY: str = ""
     OPENAI_BASE_URL: str = "https://api.openai.com/v1"
     OPENAI_MODEL: str = "gpt-4o-mini"
-    
+
+    # Agnes AI (OpenAI 兼容) Configuration
+    AGNES_API_KEY: str = ""
+    AGNES_BASE_URL: str = "https://apihub.agnes-ai.com/v1"
+    AGNES_MODEL: str = "agnes-1.5-flash"
+
     # Database Configuration
     DATABASE_URL: str = "sqlite:///./data/character_seed.db"
     
@@ -64,12 +75,13 @@ class Settings(BaseSettings):
                 "api_key": self.OPENAI_API_KEY,
                 "base_url": self.OPENAI_BASE_URL,
                 "model": self.OPENAI_MODEL
+            },
+            "agnes": {
+                "api_key": self.AGNES_API_KEY,
+                "base_url": self.AGNES_BASE_URL,
+                "model": self.AGNES_MODEL
             }
         }
         return provider_configs.get(self.LLM_PROVIDER, provider_configs["deepseek"])
-    
-    class Config:
-        env_file = ".env"
-        case_sensitive = True
 
 settings = Settings()

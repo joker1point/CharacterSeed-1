@@ -188,27 +188,47 @@ class KnowledgeBase:
         else:
             return self._search_fallback(query, limit)
     
+    def _tokenize(self, text: str) -> List[str]:
+        """
+        文本分词：支持中文按字 + 英文按词
+        """
+        import re
+        text = text.lower().strip()
+        tokens = []
+        en_tokens = re.findall(r"[a-z0-9]+", text)
+        tokens.extend(en_tokens)
+        cn_chars = re.findall(r"[\u4e00-\u9fff]", text)
+        tokens.extend(cn_chars)
+        for i in range(len(cn_chars) - 1):
+            tokens.append(cn_chars[i] + cn_chars[i + 1])
+        return tokens
+
     def _search_fallback(self, query: str, limit: int) -> List[Dict[str, Any]]:
-        """降级方案：关键词匹配"""
+        """降级方案：基于分词的关键词匹配"""
         try:
             with open(self._fallback_file, "r", encoding="utf-8") as f:
                 content = f.read()
-            
-            # 按段落分割
+
+            # 按段落分割（每段以 --- source --- 标记）
             paragraphs = [p for p in content.split("---") if p.strip()]
-            query_words = set(query.lower().split())
-            
+            query_tokens = set(self._tokenize(query))
+            if not query_tokens:
+                return []
+
             scored = []
             for i, para in enumerate(paragraphs):
-                para_words = set(para.lower().split())
-                overlap = len(query_words & para_words)
+                para_tokens = set(self._tokenize(para))
+                if not para_tokens:
+                    continue
+                overlap = len(query_tokens & para_tokens)
                 if overlap > 0:
+                    score = overlap / len(query_tokens | para_tokens)
                     scored.append({
-                        "content": para.strip(),
-                        "score": overlap / len(query_words),
+                        "text": para.strip(),
+                        "score": round(score, 4),
                         "chunk_id": i
                     })
-            
+
             scored.sort(key=lambda x: x["score"], reverse=True)
             return scored[:limit]
         except Exception as e:
