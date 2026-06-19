@@ -33,6 +33,7 @@ import sys
 import os
 import json
 import time
+from typing import Any, Dict, Optional
 
 # 确保项目根目录在 path 中（本地开发时 streamlit run 的 cwd 是项目根）
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -49,6 +50,19 @@ from frontend.api_client import (
     get_memories,
     get_conversations,
     get_growth_logs,
+    get_llm_settings,
+    list_llm_providers,
+    update_llm_settings,
+    test_llm_connection,
+    list_models,
+    test_latency,
+    probe_llm,
+    # NextChat 会话管理
+    list_sessions,
+    get_session_detail,
+    create_session,
+    rename_session,
+    delete_session,
 )
 
 # ============================================================
@@ -354,37 +368,225 @@ def render_page_create():
 # 页面 2：对话交互
 # ============================================================
 
+def _format_session_time(iso_str: str) -> str:
+    """把 ISO 时间格式化成"刚刚 / X 分钟前 / YYYY-MM-DD HH:MM"风格"""
+    if not iso_str:
+        return ""
+    try:
+        from datetime import datetime, timezone
+        # 兼容带/不带时区的 ISO 字符串
+        s = iso_str.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+        delta = now - dt
+        if delta.days >= 1:
+            return dt.strftime("%m-%d %H:%M")
+        secs = int(delta.total_seconds())
+        if secs < 60:
+            return "刚刚"
+        if secs < 3600:
+            return f"{secs // 60} 分钟前"
+        return f"{secs // 3600} 小时前"
+    except Exception:
+        return iso_str[:16]
+
+
+def _load_session_messages_into_history(char_id: int, session_id: int) -> None:
+    """从后端拉取指定 session 的全部消息，写入 st.session_state.chat_history"""
+    detail = get_session_detail(session_id)
+    if "error" in detail:
+        st.session_state.chat_history = []
+        return
+    msgs_raw = detail.get("messages", [])
+    history = []
+    for m in msgs_raw:
+        # 用户消息
+        history.append({
+            "role": "user",
+            "content": m.get("user_input", ""),
+            "timestamp": m.get("timestamp", ""),
+        })
+        # NPC 回复
+        history.append({
+            "role": "assistant",
+            "content": m.get("npc_response", ""),
+            "emotion": m.get("emotion", ""),
+            "action": m.get("action", ""),
+            "expression": m.get("expression", ""),
+            "director_raw": m.get("director_raw", ""),
+            "actor_raw": m.get("actor_raw", ""),
+            "timestamp": m.get("timestamp", ""),
+        })
+    st.session_state.chat_history = history
+    st.session_state.chat_loaded_char_id = char_id
+    st.session_state.chat_loaded_session_id = session_id
+    st.session_state.current_session_title = detail.get("title", "")
+
+
+def _refresh_sessions_cache(char_id: int) -> list:
+    """从后端拉取某角色的全部 session 列表，写入 cache"""
+    sessions = list_sessions(char_id)
+    st.session_state.sessions_cache = sessions
+    st.session_state.sessions_cache_char_id = char_id
+    return sessions
+
+
+def _render_session_sidebar(char_id: int) -> int:
+    """
+    渲染左侧"会话管理"侧栏。
+    返回：当前激活的 session_id（可能因用户操作而变化）
+
+    UI 元素：
+      - [+ 新对话] 按钮
+      - 搜索框
+      - 会话列表（每行：标题、消息数、更新时间、操作按钮）
+    """
+    # ---- 顶部操作 ----
+    st.markdown("##### 💬 会话管理")
+    if st.button(
+        "➕ 新对话", use_container_width=True, key="sidebar_new_session",
+        type="primary",
+    ):
+        result = create_session(char_id)
+        if "error" in result:
+            st.error(f"创建失败：{result['detail']}")
+        else:
+            new_sid = result.get("id")
+            st.session_state.current_session_id = new_sid
+            st.session_state.current_session_title = result.get("title", "新对话")
+            st.session_state.chat_history = []
+            st.session_state.chat_loaded_char_id = char_id
+            st.session_state.chat_loaded_session_id = new_sid
+            _refresh_sessions_cache(char_id)
+            st.rerun()
+
+    # ---- 搜索框 ----
+    search = st.text_input(
+        "🔍 搜索会话标题",
+        value=st.session_state.get("session_search", ""),
+        key="session_search_box",
+        placeholder="输入关键字过滤…",
+    )
+    # session_state 同步：保持 list_sessions 调用能拿到最新值
+    st.session_state.session_search = search
+
+    # ---- 加载会话列表 ----
+    sessions = _refresh_sessions_cache(char_id)
+    if search.strip():
+        kw = search.strip().lower()
+        sessions = [s for s in sessions if kw in s.get("title", "").lower()]
+
+    # ---- 会话列表 ----
+    if not sessions:
+        st.caption("暂无会话，点 ➕ 新对话 开始")
+        return st.session_state.get("current_session_id")
+
+    # 如果当前没有激活 session，自动选第一个（最活跃的）
+    if not st.session_state.get("current_session_id"):
+        st.session_state.current_session_id = sessions[0]["id"]
+        st.session_state.current_session_title = sessions[0].get("title", "")
+
+    current_sid = st.session_state.current_session_id
+    for s in sessions:
+        sid = s["id"]
+        is_active = (sid == current_sid)
+        title = s.get("title", "未命名") or "未命名"
+        msg_count = s.get("message_count", 0)
+        updated = _format_session_time(s.get("updated_at", ""))
+
+        # 容器：每个 session 一行；激活态用 border 高亮
+        with st.container(border=is_active):
+            # 第一行：标题 + 消息数
+            cols = st.columns([5, 1])
+            with cols[0]:
+                # 标题按钮（点击切换）
+                display = f"{'📍' if is_active else '💬'} **{title}**"
+                if st.button(
+                    display,
+                    key=f"sidebar_session_btn_{sid}",
+                    use_container_width=True,
+                    help=f"{msg_count} 条消息 · {updated}",
+                ):
+                    if not is_active:
+                        st.session_state.current_session_id = sid
+                        st.session_state.current_session_title = title
+                        # 加载该 session 的消息
+                        _load_session_messages_into_history(char_id, sid)
+                        st.rerun()
+            with cols[1]:
+                st.caption(f"`{msg_count}`")
+
+            # 第二行：更新时间
+            st.caption(f"🕐 {updated}")
+
+            # 第三行：操作按钮（重命名 / 删除）— 仅激活态展开，避免误操作
+            if is_active:
+                op_cols = st.columns(2)
+                with op_cols[0]:
+                    with st.popover("✏️ 重命名", use_container_width=True):
+                        new_title = st.text_input(
+                            "新标题", value=title, key=f"rename_input_{sid}",
+                            max_chars=200,
+                        )
+                        if st.button(
+                            "保存", key=f"rename_save_{sid}",
+                            type="primary", use_container_width=True,
+                        ):
+                            r = rename_session(sid, new_title)
+                            if "error" in r:
+                                st.error(f"失败：{r['detail']}")
+                            else:
+                                st.session_state.current_session_title = new_title
+                                _refresh_sessions_cache(char_id)
+                                st.rerun()
+                with op_cols[1]:
+                    with st.popover("🗑️ 删除", use_container_width=True):
+                        st.warning(f"删除 **{title}** 及其全部 {msg_count} 条消息？")
+                        if st.button(
+                            "确认删除", key=f"delete_confirm_{sid}",
+                            type="primary", use_container_width=True,
+                        ):
+                            r = delete_session(sid)
+                            if "error" in r:
+                                st.error(f"失败：{r['detail']}")
+                            else:
+                                st.session_state.current_session_id = None
+                                st.session_state.current_session_title = ""
+                                st.session_state.chat_history = []
+                                st.session_state.chat_loaded_session_id = None
+                                _refresh_sessions_cache(char_id)
+                                st.rerun()
+
+    return st.session_state.current_session_id
+
+
 def render_page_chat():
     """
-    对话交互页面。
+    对话交互页面（NextChat 风格：左侧会话管理 + 右侧对话气泡）。
 
     UI 布局：
-      ┌────────────────────────────────────┐
-      │  标题：💬 角色对话                 │
-      │  [角色选择器]                       │
-      │  角色信息栏（名称/人格摘要）        │
-      │  ┌──────────────────────────┐      │
-      │  │ 对话气泡区               │      │
-      │  │ 用户消息 (右)            │      │
-      │  │ NPC 回复 (左) + 标签     │      │
-      │  │   emotion / action /     │      │
-      │  │   expression             │      │
-      │  └──────────────────────────┘      │
-      │  [消息输入框 chat_input]            │
-      │  ──── 侧栏 ────                    │
-      │  [🌱 触发成长] [🗑️ 清空对话]      │
-      └────────────────────────────────────┘
+      ┌──────────────────┬──────────────────────────────────────┐
+      │  标题：💬 角色对话                                          │
+      │  [角色选择器]                                                │
+      │  角色信息栏                                                  │
+      ├──────────────────┼──────────────────────────────────────┤
+      │  会话侧栏          │  对话气泡区                              │
+      │  + 新对话          │  用户消息 (右)                            │
+      │  🔍 搜索           │  NPC 回复 (左) + 标签                    │
+      │  📜 会话列表       │                                          │
+      │   💬 标题 3         │  [消息输入框 chat_input]                │
+      │      3 条 · 5分钟前 │  ──── 侧栏 ────                          │
+      │      ✏️  🗑️         │  [🌱 触发成长]                            │
+      └──────────────────┴──────────────────────────────────────┘
 
     交互流程（Director + Actor 双 LLM 管线）：
-      1. 用户输入消息 → POST /api/chat
+      1. 用户输入消息 → POST /api/chat（带 session_id）
       2. 后端执行 Director.analyze() → emotion/focus_memories/goal/style
       3. 后端执行 Actor.generate()  → action/expression/speech
-      4. 前端展示回复气泡 + 标签
-
-    为何用 st.chat_message 而非手写 HTML：
-      Streamlit 1.29 内置的聊天组件提供了与 ChatGPT 一致的交互体验。
-      原生支持 user/assistant 两种角色，自动处理 CSS 样式和对齐。
-      手写 st.markdown + HTML 会增加大量非语义化的样式代码。
+      4. 后端把消息写入对应 session，并 touch updated_at
+      5. 响应返回 session_id / session_title，前端刷新侧栏
     """
     st.title("💬 角色对话")
     st.markdown("选择一名角色，开始对话。AI 将通过 Director+Actor 双管线生成角色的反应。")
@@ -396,14 +598,13 @@ def render_page_chat():
 
     # ---- 角色信息栏 ----
     char_detail = get_character(char_id)
-    if char_detail.get("error"):
+    if "error" in char_detail:
         st.error(f"无法加载角色信息：{char_detail['detail']}")
         return
 
     personality = safe_parse_json(char_detail.get("personality"))
     current_state = safe_parse_json(char_detail.get("current_state"))
 
-    # 人格摘要（一行文本，用最极端的人格维度描述角色）
     if personality:
         top_trait = max(personality.items(), key=lambda x: x[1]) if personality else (None, 0)
         bottom_trait = min(personality.items(), key=lambda x: x[1]) if personality else (None, 0)
@@ -425,47 +626,48 @@ def render_page_chat():
 
     st.divider()
 
-    # ---- 对话历史初始化 ----
-    # 为何用 session_state 缓存而非每次从后端加载：
-    #   对话是实时交互，session_state 保存当前会话的上下文
-    #   刷新页面时清空缓存（从后端重新加载最近的对话记录），
-    #   避免数据冗余和状态不一致。
+    # ---- 角色切换检测：清空 session 缓存 + 重置激活 session ----
+    if st.session_state.get("chat_loaded_char_id") != char_id:
+        st.session_state.sessions_cache = []
+        st.session_state.sessions_cache_char_id = None
+        st.session_state.current_session_id = None
+        st.session_state.current_session_title = ""
+        st.session_state.chat_loaded_session_id = None
+
+    # ---- 左右分栏：会话侧栏 + 对话区 ----
+    sidebar_col, chat_col = st.columns([1, 2.5], gap="medium")
+
+    with sidebar_col:
+        active_sid = _render_session_sidebar(char_id)
+    with chat_col:
+        # 渲染当前 session 的标题 + 消息 + 输入
+        _render_chat_area(char_id, active_sid)
+
+
+def _render_chat_area(char_id: int, session_id: Optional[int]) -> None:
+    """右侧对话区：标题 / 气泡列表 / 输入框 / 成长按钮"""
+    # ---- 当前会话标题 ----
+    title = st.session_state.get("current_session_title") or "（未选择会话）"
+    st.markdown(f"#### 📍 {title}")
+    if session_id is None:
+        st.info("👈 请在左侧选择或创建一个会话")
+        return
+
+    # ---- 加载历史（如果 session 变了） ----
+    if (
+        st.session_state.get("chat_loaded_char_id") != char_id
+        or st.session_state.get("chat_loaded_session_id") != session_id
+    ):
+        _load_session_messages_into_history(char_id, session_id)
+
+    # 确保 chat_history 存在
     if "chat_history" not in st.session_state:
         st.session_state.chat_history = []
 
-    # 从后端加载最近对话并追加到 chat_history（仅在首次或刷新时）
-    if "chat_loaded_char_id" not in st.session_state or st.session_state.chat_loaded_char_id != char_id:
-        conversations = get_conversations(char_id, limit=50)
-        st.session_state.chat_history = []
-        for conv in conversations:
-            # 用户消息
-            st.session_state.chat_history.append({
-                "role": "user",
-                "content": conv.get("user_input", ""),
-                "timestamp": conv.get("timestamp", ""),
-            })
-            # NPC 回复
-            st.session_state.chat_history.append({
-                "role": "assistant",
-                "content": conv.get("npc_response", ""),
-                "emotion": conv.get("emotion", ""),
-                "action": conv.get("action", ""),
-                "expression": conv.get("expression", ""),
-                "director_raw": conv.get("director_raw", ""),
-                "actor_raw": conv.get("actor_raw", ""),
-                "timestamp": conv.get("timestamp", ""),
-            })
-        st.session_state.chat_loaded_char_id = char_id
-
     # ---- 渲染对话气泡 ----
-    # 为何用两层嵌套渲染：
-    #   外层遍历 chat_history，内层对每条消息调用 st.chat_message()。
-    #   st.chat_message 必须直接作为上下文管理器使用，
-    #   每一条调用会在 UI 上追加一个气泡。不支持"收集→批量渲染"模式。
     for msg in st.session_state.chat_history:
         with st.chat_message(msg["role"]):
             st.write(msg["content"])
-            # NPC 消息额外交互标签
             if msg["role"] == "assistant":
                 tags = []
                 if msg.get("emotion"):
@@ -478,10 +680,6 @@ def render_page_chat():
                     st.caption(" · ".join(tags))
 
     # ---- 消息输入 ----
-    # 为何用 st.chat_input 而非 st.text_input + button：
-    #   chat_input 是 Streamlit 1.29 为聊天场景优化的组件。
-    #   它始终固定在页面底部，左对齐输入框 + 发送按钮。
-    #   用户体验与 ChatGPT/微信一致。
     user_msg = st.chat_input("输入消息...", key="chat_input_box")
 
     if user_msg:
@@ -491,16 +689,21 @@ def render_page_chat():
             "content": user_msg,
         })
 
-        # 调用后端对话 API
+        # 调用后端对话 API（带 session_id）
         with st.spinner("💭 角色正在思考..."):
-            chat_result = send_message(char_id, user_msg)
+            chat_result = send_message(char_id, user_msg, session_id=session_id)
 
         if chat_result.get("error"):
             st.error(f"对话失败：{chat_result['detail']}")
-            # 移除刚追加的用户消息（因为发送失败）
             st.session_state.chat_history.pop()
         else:
-            # 追加 NPC 回复到历史
+            # 同步后端返回的 session_id / session_title
+            new_sid = chat_result.get("session_id") or session_id
+            new_title = chat_result.get("session_title") or title
+            st.session_state.current_session_id = new_sid
+            st.session_state.current_session_title = new_title
+            st.session_state.chat_loaded_session_id = new_sid
+
             st.session_state.chat_history.append({
                 "role": "assistant",
                 "content": chat_result.get("npc_response", ""),
@@ -512,10 +715,7 @@ def render_page_chat():
                 "timestamp": str(chat_result.get("timestamp", "")),
             })
 
-            # ---- 展示 LLM 原始响应（折叠，供调试） ----
-            # 为何展示 raw 响应：
-            #   Director/Actor 的原始 JSON 输出提供了角色的"思考过程"
-            #   对于开发者/Demo 观众而言，这是系统可解释性的关键窗口
+            # 展示 LLM 原始响应（折叠）
             if chat_result.get("director_raw") or chat_result.get("actor_raw"):
                 with st.expander("🔍 LLM 管线内部响应 (调试)", expanded=False):
                     if chat_result.get("director_raw"):
@@ -531,59 +731,48 @@ def render_page_chat():
                         except json.JSONDecodeError:
                             st.text(chat_result["actor_raw"])
 
+            # 刷新侧栏 session 列表（让 updated_at / message_count 立即更新）
+            _refresh_sessions_cache(char_id)
+
         st.rerun()
 
     # ---- 侧边操作 ----
     st.divider()
-    col_grow, col_clear = st.columns(2)
+    if st.button("🌱 触发角色成长", use_container_width=True, key="chat_growth_btn"):
+        with st.spinner("⏳ Growth LLM 正在分析角色成长..."):
+            growth_result = trigger_growth(char_id)
 
-    with col_grow:
-        if st.button("🌱 触发角色成长", use_container_width=True, key="chat_growth_btn"):
-            with st.spinner("⏳ Growth LLM 正在分析角色成长..."):
-                growth_result = trigger_growth(char_id)
+        if growth_result.get("error"):
+            st.error(f"成长触发失败：{growth_result['detail']}")
+        else:
+            st.success(f"✅ 成长分析完成！")
+            st.markdown(f"**事件摘要：** {growth_result.get('event_summary', '无')}")
 
-            if growth_result.get("error"):
-                st.error(f"成长触发失败：{growth_result['detail']}")
-            else:
-                st.success(f"✅ 成长分析完成！")
+            delta_raw = growth_result.get("personality_delta", "{}")
+            delta = safe_parse_json(delta_raw)
+            if delta:
+                st.markdown("**人格变化 (Δ)：**")
+                for key, cn_name in PERSONALITY_DIMS:
+                    dv = delta.get(key, 0)
+                    if dv != 0:
+                        arrow = "↑" if dv > 0 else "↓"
+                        color = "green" if dv > 0 else "red"
+                        st.markdown(f"  {cn_name}: :{color}[{arrow}{abs(dv)}]")
 
-                # 展示成长摘要
-                st.markdown(f"**事件摘要：** {growth_result.get('event_summary', '无')}")
+            new_memories_raw = growth_result.get("new_memories", "[]")
+            new_memories = safe_parse_json(new_memories_raw) if isinstance(new_memories_raw, str) else new_memories_raw
+            if new_memories:
+                with st.expander("🧠 新增记忆", expanded=True):
+                    for nm in new_memories:
+                        if isinstance(nm, dict):
+                            st.markdown(f"- [{nm.get('importance', 5)}/10] {nm.get('content', '')}")
 
-                # 展示人格变化
-                delta_raw = growth_result.get("personality_delta", "{}")
-                delta = safe_parse_json(delta_raw)
-                if delta:
-                    st.markdown("**人格变化 (Δ)：**")
-                    for key, cn_name in PERSONALITY_DIMS:
-                        dv = delta.get(key, 0)
-                        if dv != 0:
-                            arrow = "↑" if dv > 0 else "↓"
-                            color = "green" if dv > 0 else "red"
-                            st.markdown(f"  {cn_name}: :{color}[{arrow}{abs(dv)}]")
-
-                # 新记忆
-                new_memories_raw = growth_result.get("new_memories", "[]")
-                new_memories = safe_parse_json(new_memories_raw) if isinstance(new_memories_raw, str) else new_memories_raw
-                if new_memories:
-                    with st.expander("🧠 新增记忆", expanded=True):
-                        for nm in new_memories:
-                            if isinstance(nm, dict):
-                                st.markdown(f"- [{nm.get('importance', 5)}/10] {nm.get('content', '')}")
-
-                # Growth LLM 原始响应
-                if growth_result.get("growth_raw"):
-                    with st.expander("🔍 Growth LLM 原始响应", expanded=False):
-                        try:
-                            st.json(json.loads(growth_result["growth_raw"]))
-                        except json.JSONDecodeError:
-                            st.text(growth_result["growth_raw"])
-
-    with col_clear:
-        if st.button("🗑️ 清空当前对话显示", use_container_width=True, key="chat_clear_btn"):
-            st.session_state.chat_history = []
-            st.session_state.chat_loaded_char_id = None
-            st.rerun()
+            if growth_result.get("growth_raw"):
+                with st.expander("🔍 Growth LLM 原始响应", expanded=False):
+                    try:
+                        st.json(json.loads(growth_result["growth_raw"]))
+                    except json.JSONDecodeError:
+                        st.text(growth_result["growth_raw"])
 
 
 # ============================================================
@@ -780,6 +969,598 @@ def render_page_dashboard():
 
 
 # ============================================================
+# 页面 4：LLM 设置（参考 NextChat 的 settings 模式）
+# ============================================================
+
+def _get_provider_needs_key(provider_id: str, providers_meta: list) -> bool:
+    """根据元信息查某个 provider 是否需要 api_key。"""
+    for m in providers_meta:
+        if m.get("id") == provider_id:
+            return str(m.get("needs_key", "true")).lower() == "true"
+    return True  # 默认需要 key（保守策略）
+
+
+def render_page_settings():
+    """
+    LLM 设置页面。
+
+    UI 布局（自上而下）：
+      ┌────────────────────────────────────────────┐
+      │  标题：⚙️ LLM 设置                         │
+      │  当前激活 provider 状态条                   │
+      │  ┌──────────────────────────────────────┐  │
+      │  │ 📌 激活 Provider                     │  │
+      │  │  [下拉选择] [切换]                    │  │
+      │  └──────────────────────────────────────┘  │
+      │  ┌──────────────────────────────────────┐  │
+      │  │ 🔑 当前 Provider 配置                 │  │
+      │  │  API Key: [password input]            │  │
+      │  │  Base URL: [text input]               │  │
+      │  │  Model: [text input]                  │  │
+      │  │  [测试连接] [保存]                     │  │
+      │  └──────────────────────────────────────┘  │
+      │  ┌──────────────────────────────────────┐  │
+      │  │ 🎛️ 默认调用参数                       │  │
+      │  │  Temperature: [slider 0-2]            │  │
+      │  │  Max Tokens: [number input]           │  │
+      │  └──────────────────────────────────────┘  │
+      │  ┌──────────────────────────────────────┐  │
+      │  │ 📦 其他 Provider 配置（折叠）         │  │
+      │  │  列出全部 6 个 provider 的脱敏状态    │  │
+      │  └──────────────────────────────────────┘  │
+      │  文件位置: <path>                          │
+      └────────────────────────────────────────────┘
+    """
+    st.title("⚙️ LLM 设置")
+    st.markdown(
+        "管理 **大语言模型厂商** 与 **API Key**。"
+        "所有更改会保存到 `usercontext/llm_settings.json`，**无需重启后端**即可生效。"
+    )
+
+    # ---- 拉取设置与厂商元信息 ----
+    settings = get_llm_settings()
+    if "error" in settings:
+        st.error(f"❌ 无法加载设置：{settings['detail']}")
+        st.info("请确认后端 uvicorn 已启动在 :8000")
+        return
+
+    providers_info = list_llm_providers()
+    if "error" in providers_info:
+        st.error(f"❌ 无法加载厂商列表：{providers_info['detail']}")
+        return
+    providers_meta = providers_info.get("providers", [])
+
+    active_id = settings.get("active_provider", "agnes")
+    active_name = settings.get("active_provider_name", active_id)
+    active_cfg = settings.get("config", {})
+
+    # ---- 状态条：当前激活 provider ----
+    st.info(f"📌 当前激活：**{active_name}** (`{active_id}`)，模型 `{active_cfg.get('model', '-')}`")
+
+    # ---- 区块 1：切换 Provider ----
+    st.subheader("1️⃣ 切换 Provider")
+    provider_options = [m["id"] for m in providers_meta]
+    provider_labels = {
+        m["id"]: f"{m['name']} ({m['id']})" for m in providers_meta
+    }
+
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        new_active = st.selectbox(
+            "选择要激活的 provider",
+            provider_options,
+            index=provider_options.index(active_id) if active_id in provider_options else 0,
+            format_func=lambda x: provider_labels.get(x, x),
+            key="settings_active_provider_select",
+        )
+    with col2:
+        st.write("")  # 占位
+        st.write("")
+        if st.button("🔄 切换", use_container_width=True, key="settings_switch_btn"):
+            if new_active == active_id:
+                st.info("当前已是该 provider，无需切换")
+            else:
+                result = update_llm_settings(active_provider=new_active)
+                if "error" in result:
+                    st.error(f"切换失败：{result['detail']}")
+                else:
+                    st.success(f"✅ 已切换到 **{result.get('active_provider_name', new_active)}**")
+                    time.sleep(0.5)
+                    st.rerun()
+
+    st.divider()
+
+    # ---- 区块 2：当前 Provider 的详细配置 ----
+    st.subheader(f"2️⃣ 当前 Provider 配置 — {active_name}")
+
+    # API Key：脱敏显示在 caption 中，主输入框默认空（用户想改就输入新值）
+    masked_key = active_cfg.get("api_key", "")
+    key_caption = (
+        f"当前已保存 key: `{masked_key}`"
+        if masked_key and not masked_key.startswith("****")
+        else "（当前 key 为空或已脱敏）"
+    )
+
+    needs_key = _get_provider_needs_key(active_id, providers_meta)
+    if needs_key:
+        st.caption(key_caption)
+        new_api_key = st.text_input(
+            "API Key（留空 = 不修改）",
+            type="password",
+            key=f"settings_api_key_{active_id}",
+            placeholder="留空保持原值；填写新值则覆盖",
+        )
+    else:
+        # Ollama 不需要 key
+        st.caption("🔓 本地服务（Ollama）无需 API Key")
+        new_api_key = None
+
+    new_base_url = st.text_input(
+        "Base URL",
+        value=active_cfg.get("base_url", ""),
+        key=f"settings_base_url_{active_id}",
+    )
+    new_model = st.text_input(
+        "Model 名称",
+        value=active_cfg.get("model", ""),
+        key=f"settings_model_{active_id}",
+    )
+
+    # ---- 操作按钮：测试 + 保存 ----
+    col_test, col_save = st.columns(2)
+    with col_test:
+        test_clicked = st.button("🧪 测试连接", use_container_width=True, key="settings_test_btn")
+    with col_save:
+        save_clicked = st.button("💾 保存配置", use_container_width=True, type="primary", key="settings_save_btn")
+
+    # ---- 测试连接 ----
+    if test_clicked:
+        with st.spinner("正在连接 LLM..."):
+            # 如果用户已填了新的 api_key（未保存），用它来测试
+            test_kwargs = {
+                "provider_id": active_id,
+                "base_url": new_base_url or None,
+                "model": new_model or None,
+            }
+            if needs_key and new_api_key:
+                test_kwargs["api_key"] = new_api_key
+            result = test_llm_connection(**test_kwargs)
+        if "error" in result:
+            st.error(f"❌ {result['detail']}")
+        else:
+            if result.get("success"):
+                st.success(
+                    f"✅ {result.get('message', '成功')}  "
+                    f"延迟 **{result.get('latency_ms', '-')} ms**\n\n"
+                    f"> {result.get('response_text', '')[:160]}"
+                )
+            else:
+                st.error(f"❌ {result.get('message', '连接失败')}")
+
+    # ---- 保存配置 ----
+    if save_clicked:
+        active_config_payload: Dict[str, Any] = {}
+        if needs_key and new_api_key:
+            # 用户填了新 key → 覆盖
+            active_config_payload["api_key"] = new_api_key
+        if new_base_url and new_base_url != active_cfg.get("base_url"):
+            active_config_payload["base_url"] = new_base_url
+        if new_model and new_model != active_cfg.get("model"):
+            active_config_payload["model"] = new_model
+
+        if not active_config_payload:
+            st.info("ℹ️ 未检测到任何修改，无需保存")
+        else:
+            result = update_llm_settings(active_config=active_config_payload)
+            if "error" in result:
+                st.error(f"❌ 保存失败：{result['detail']}")
+            else:
+                st.success("✅ 配置已保存，下次对话/创建即生效")
+                time.sleep(0.5)
+                st.rerun()
+
+    st.divider()
+
+    # ---- 区块 3：默认调用参数 ----
+    st.subheader("3️⃣ 默认调用参数")
+    st.caption("新建对话/角色时使用的默认 temperature 和 max_tokens。导演/演员模块的固定温度不受影响。")
+
+    cur_temp = float(settings.get("default_temperature", 0.7))
+    cur_tokens = int(settings.get("default_max_tokens", 1000))
+
+    col1, col2 = st.columns(2)
+    with col1:
+        new_temp = st.slider(
+            "Temperature",
+            min_value=0.0,
+            max_value=2.0,
+            value=cur_temp,
+            step=0.05,
+            key="settings_temp_slider",
+        )
+    with col2:
+        new_tokens = st.number_input(
+            "Max Tokens",
+            min_value=100,
+            max_value=8000,
+            value=cur_tokens,
+            step=100,
+            key="settings_tokens_input",
+        )
+
+    if st.button("💾 保存默认参数", key="settings_save_defaults_btn"):
+        changed = {}
+        if abs(new_temp - cur_temp) > 1e-6:
+            changed["default_temperature"] = new_temp
+        if new_tokens != cur_tokens:
+            changed["default_max_tokens"] = new_tokens
+        if not changed:
+            st.info("ℹ️ 未检测到修改")
+        else:
+            result = update_llm_settings(**changed)
+            if "error" in result:
+                st.error(f"❌ {result['detail']}")
+            else:
+                st.success("✅ 默认参数已更新")
+                time.sleep(0.4)
+                st.rerun()
+
+    st.divider()
+
+    # ---- 区块 4：其他 Provider 概览（只读 + 脱敏）----
+    st.subheader("4️⃣ 其他 Provider 概览")
+    with st.expander("展开查看全部 provider 当前状态", expanded=False):
+        for m in providers_meta:
+            pid = m["id"]
+            pname = m["name"]
+            cfg = settings.get("providers", {}).get(pid, {})
+            masked = cfg.get("api_key", "")
+            has_key = bool(masked) and not masked.startswith("****")
+            mark = "🟢" if (m["needs_key"] == "false" or has_key) else "🟡"
+            active_mark = " ⭐（当前激活）" if pid == active_id else ""
+            st.markdown(
+                f"{mark} **{pname}** (`{pid}`){active_mark}  \n"
+                f"&nbsp;&nbsp;• base_url: `{cfg.get('base_url', '-')}`  \n"
+                f"&nbsp;&nbsp;• model: `{cfg.get('model', '-')}`  \n"
+                f"&nbsp;&nbsp;• api_key: `{masked or '（空）'}`"
+            )
+
+    st.caption(f"📁 配置文件：`{settings.get('settings_file_path', '-')}`")
+
+
+# ============================================================
+# 页面 5：API 测试（参考 web-tools/react-vite 的 API Dashboard）
+# ============================================================
+
+def render_page_api_test():
+    """
+    API 连通性测试页面。
+
+    三大能力（对应 web-tools/react-vite 的功能）：
+      1. 一键拉取 /v1/models 列表（含耗时）
+      2. 流式延迟测试（TTFT + 总延迟 + 响应片段 + 历史）
+      3. 原始请求探针（debug 模式，查看完整 request/response）
+
+    设计原则：
+      - 全部从 LLM 设置页继承 provider / API Key（不重复输入）
+      - 模型列表：可点击"应用到延迟测试"以快速填入
+      - 历史记录：保留在 session_state，与 web-tools 行为一致
+    """
+    st.title("🧪 API 测试")
+    st.markdown(
+        "验证 **LLM Provider 连通性**。能力移植自 "
+        "[joker1point/web-tools](https://github.com/joker1point/web-tools) 的 API Dashboard。"
+    )
+
+    # ---- 拉取设置 ----
+    settings = get_llm_settings()
+    if "error" in settings:
+        st.error(f"❌ 无法加载设置：{settings['detail']}")
+        return
+
+    active_id = settings.get("active_provider", "agnes")
+    active_name = settings.get("active_provider_name", active_id)
+    active_cfg = settings.get("config", {})
+
+    # ---- Provider 选择与快速概览 ----
+    st.info(
+        f"📌 当前激活：**{active_name}** (`{active_id}`) · "
+        f"模型 `{active_cfg.get('model', '-')}` · "
+        f"base_url `{active_cfg.get('base_url', '-')}`"
+    )
+
+    providers_info = list_llm_providers()
+    providers_meta = providers_info.get("providers", []) if "error" not in providers_info else []
+    provider_options = [m["id"] for m in providers_meta] if providers_meta else [active_id]
+    provider_labels = {
+        m["id"]: f"{m['name']} ({m['id']})" for m in providers_meta
+    } if providers_meta else {active_id: active_id}
+
+    target_pid = st.selectbox(
+        "🔧 测试目标 provider（与设置页激活 provider 解耦）",
+        provider_options,
+        index=provider_options.index(active_id) if active_id in provider_options else 0,
+        format_func=lambda x: provider_labels.get(x, x),
+        key="apitest_target_provider",
+    )
+    # 切换 provider 后，对应 cfg 也要切换（用于展示给用户看）
+    target_cfg = settings.get("providers", {}).get(target_pid, {})
+    if not target_cfg:
+        st.warning(f"⚠️ provider `{target_pid}` 没有配置")
+        return
+
+    st.divider()
+
+    # ---- 标签页 ----
+    tab_models, tab_latency, tab_probe = st.tabs(
+        ["📜 Models 列表", "⚡ 流式延迟测试", "🔍 探针 (Debug)"]
+    )
+
+    # -------------------- Tab 1: Models 列表 --------------------
+    with tab_models:
+        st.subheader("1️⃣ 一键拉取 /v1/models")
+        st.caption(
+            "调用 provider 的 `GET /v1/models` 接口，返回该账号可用的全部模型。"
+            "Anthropic 兼容 provider 会自动注入 `x-api-key` 头。"
+        )
+
+        col_btn, col_info = st.columns([1, 3])
+        with col_btn:
+            fetch_clicked = st.button(
+                "🔄 拉取 Models",
+                type="primary",
+                use_container_width=True,
+                key="apitest_fetch_models_btn",
+            )
+        with col_info:
+            st.caption(f"目标：{provider_labels.get(target_pid, target_pid)}")
+
+        if fetch_clicked:
+            with st.spinner("⏳ 拉取中..."):
+                result = list_models(provider_id=target_pid)
+            if "error" in result:
+                st.error(f"❌ 拉取失败：{result['detail']}")
+            else:
+                st.session_state["apitest_models"] = result
+
+        result = st.session_state.get("apitest_models")
+        if result and result.get("provider_id") == target_pid:
+            models = result.get("models", [])
+            duration = result.get("duration_ms", 0)
+            st.success(
+                f"✅ 共 **{len(models)}** 个模型，耗时 **{duration}ms**"
+            )
+            if models:
+                # 用 dataframe 展示 + 选择列（点击后填入延迟测试的 model 字段）
+                df_data = [
+                    {
+                        "模型 ID": m.get("id", ""),
+                        "所有者": m.get("owned_by", "-") or "-",
+                        "对象": m.get("object", "model"),
+                    }
+                    for m in models
+                ]
+                st.dataframe(
+                    df_data,
+                    use_container_width=True,
+                    hide_index=True,
+                    key="apitest_models_table",
+                )
+
+                # "应用到延迟测试"按钮组
+                st.caption("💡 点击下方按钮可将模型 ID 填入延迟测试输入框")
+                cols_per_row = 4
+                for i in range(0, min(len(models), 12), cols_per_row):
+                    cols = st.columns(cols_per_row)
+                    for j, col in enumerate(cols):
+                        idx = i + j
+                        if idx >= len(models):
+                            break
+                        m = models[idx]
+                        if col.button(
+                            f"📌 {m.get('id', '')[:24]}",
+                            key=f"apitest_pick_model_{idx}",
+                            use_container_width=True,
+                            help=m.get("id", ""),
+                        ):
+                            st.session_state["apitest_latency_model"] = m.get("id", "")
+                            st.toast(f"已应用模型：{m.get('id', '')}", icon="✅")
+
+    # -------------------- Tab 2: 流式延迟测试 --------------------
+    with tab_latency:
+        st.subheader("2️⃣ 流式延迟测试（TTFT + 总延迟）")
+        st.caption(
+            "发送 `stream=true` 的 chat 请求，测量首字节时间（TTFT）与总延迟。"
+            "测试参数**不写盘**，仅用于本次连通性验证。"
+        )
+
+        # 持久化测试历史
+        if "apitest_latency_history" not in st.session_state:
+            st.session_state["apitest_latency_history"] = []
+
+        col_msg, col_tok = st.columns([3, 1])
+        with col_msg:
+            test_msg = st.text_input(
+                "📝 测试消息",
+                value="Hi",
+                max_chars=2000,
+                key="apitest_latency_msg",
+            )
+        with col_tok:
+            max_tok = st.number_input(
+                "max_tokens",
+                min_value=1,
+                max_value=2048,
+                value=16,
+                step=1,
+                key="apitest_latency_max_tokens",
+            )
+
+        # 模型字段：从 session_state 读取默认值（可被"应用"按钮覆盖）
+        default_model = st.session_state.get(
+            "apitest_latency_model", target_cfg.get("model", ""),
+        )
+        model_input = st.text_input(
+            "🤖 模型（可手动修改，留空则用 provider 默认）",
+            value=default_model,
+            key="apitest_latency_model_input",
+        )
+
+        col_run, col_clear = st.columns([1, 1])
+        with col_run:
+            run_clicked = st.button(
+                "🚀 运行延迟测试",
+                type="primary",
+                use_container_width=True,
+                key="apitest_run_latency_btn",
+            )
+        with col_clear:
+            if st.button(
+                "🗑️ 清空历史",
+                use_container_width=True,
+                key="apitest_clear_latency_btn",
+            ):
+                st.session_state["apitest_latency_history"] = []
+                st.rerun()
+
+        if run_clicked:
+            with st.spinner("⏳ 正在测试流式响应..."):
+                result = test_latency(
+                    provider_id=target_pid,
+                    model=model_input.strip() or None,
+                    test_message=test_msg,
+                    max_tokens=int(max_tok),
+                )
+            if "error" in result:
+                st.error(f"❌ 测试失败：{result['detail']}")
+            else:
+                # 写入历史（带时间戳 + provider/model/msg 元信息）
+                from datetime import datetime
+                history = st.session_state["apitest_latency_history"]
+                history.insert(0, {
+                    **result,
+                    "timestamp": datetime.now().strftime("%H:%M:%S"),
+                    "test_message": test_msg,
+                    "max_tokens": int(max_tok),
+                })
+                # 保留最近 20 条
+                st.session_state["apitest_latency_history"] = history[:20]
+
+        # 展示最新一次结果
+        history = st.session_state.get("apitest_latency_history", [])
+        if history:
+            latest = history[0]
+            st.divider()
+            st.markdown("##### 📊 最新一次结果")
+            cols = st.columns(4)
+            status = latest.get("status", 0)
+            ok = 200 <= status < 300 and not latest.get("error")
+            cols[0].metric("状态码", f"{status}" if status else "-",
+                          delta="OK" if ok else "FAIL",
+                          delta_color="normal" if ok else "inverse")
+            cols[1].metric("TTFT (ms)", latest.get("ttft_ms") or "-")
+            cols[2].metric("总延迟 (ms)", latest.get("total_ms") or "-")
+            cols[3].metric("SSE 块数", latest.get("chunks", 0))
+            if latest.get("error"):
+                st.error(f"❌ 错误：{latest['error']}")
+            if latest.get("content"):
+                st.caption("响应片段：")
+                st.code(latest["content"], language="text")
+
+            st.divider()
+            st.markdown("##### 📜 历史记录（最近 20 次）")
+            hist_rows = []
+            for h in history:
+                hist_rows.append({
+                    "时间": h.get("timestamp", "-"),
+                    "状态": h.get("status", 0),
+                    "TTFT (ms)": h.get("ttft_ms") or "-",
+                    "总延迟 (ms)": h.get("total_ms") or "-",
+                    "块数": h.get("chunks", 0),
+                    "模型": h.get("model", "-")[:32],
+                    "消息": (h.get("test_message", "") or "")[:30],
+                })
+            st.dataframe(
+                hist_rows,
+                use_container_width=True,
+                hide_index=True,
+                key="apitest_latency_history_table",
+            )
+
+    # -------------------- Tab 3: 探针 --------------------
+    with tab_probe:
+        st.subheader("3️⃣ 原始请求探针（Debug 模式）")
+        st.caption(
+            "发送一次**非流式**请求，返回完整的 `request/response` 头/体（密钥已脱敏）。"
+            "用于排查 provider 鉴权、路由、协议差异。"
+        )
+
+        col_pmsg, col_ptok = st.columns([3, 1])
+        with col_pmsg:
+            probe_msg = st.text_input(
+                "📝 测试消息",
+                value="Hi",
+                max_chars=2000,
+                key="apitest_probe_msg",
+            )
+        with col_ptok:
+            probe_tok = st.number_input(
+                "max_tokens",
+                min_value=1,
+                max_value=2048,
+                value=16,
+                step=1,
+                key="apitest_probe_max_tokens",
+            )
+
+        if st.button(
+            "🔬 启动探针",
+            type="primary",
+            use_container_width=True,
+            key="apitest_probe_btn",
+        ):
+            with st.spinner("⏳ 探针运行中..."):
+                result = probe_llm(
+                    provider_id=target_pid,
+                    test_message=probe_msg,
+                    max_tokens=int(probe_tok),
+                )
+            if "error" in result:
+                st.error(f"❌ 探针失败：{result['detail']}")
+            else:
+                st.session_state["apitest_probe_result"] = result
+
+        probe = st.session_state.get("apitest_probe_result")
+        if probe and probe.get("provider_id") == target_pid:
+            err = probe.get("error")
+            resp = probe.get("response", {})
+            req = probe.get("request", {})
+            if err:
+                st.error(f"❌ {err}")
+            else:
+                st.success(
+                    f"✅ HTTP {resp.get('status')} · 耗时 {resp.get('duration_ms')}ms"
+                )
+
+            with st.expander("📤 Request", expanded=True):
+                st.markdown(f"**{req.get('method', 'POST')}** `{req.get('url', '-')}`")
+                st.json({
+                    "headers": req.get("headers", {}),
+                    "body": req.get("body", {}),
+                })
+
+            with st.expander("📥 Response Headers", expanded=False):
+                st.json(resp.get("headers", {}))
+
+            with st.expander("📥 Response Body", expanded=True):
+                body = resp.get("body", "")
+                if isinstance(body, (dict, list)):
+                    st.json(body)
+                else:
+                    st.code(body, language="text")
+
+
+# ============================================================
 # 主入口 + 侧边栏
 # ============================================================
 
@@ -829,7 +1610,7 @@ def main():
         #   selectbox 需要点击展开，对首次使用的用户不够友好。
         page = st.radio(
             "📂 功能导航",
-            ["🌱 角色创建", "💬 对话交互", "📊 角色状态"],
+            ["🌱 角色创建", "💬 对话交互", "📊 角色状态", "⚙️ LLM 设置", "🧪 API 测试"],
             key="nav_radio",
         )
 
@@ -849,6 +1630,10 @@ def main():
         render_page_chat()
     elif page == "📊 角色状态":
         render_page_dashboard()
+    elif page == "⚙️ LLM 设置":
+        render_page_settings()
+    elif page == "🧪 API 测试":
+        render_page_api_test()
 
 
 if __name__ == "__main__":
