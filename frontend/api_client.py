@@ -180,7 +180,11 @@ def get_character(character_id: int) -> Dict[str, Any]:
 # 对话 API (1 个端点)
 # ============================================================
 
-def send_message(character_id: int, message: str) -> Dict[str, Any]:
+def send_message(
+    character_id: int,
+    message: str,
+    session_id: Optional[int] = None,
+) -> Dict[str, Any]:
     """
     发送玩家消息，获取 NPC 回复（Director + Actor 双 LLM 管线）。
     端点: POST /api/chat (JSON body)
@@ -188,22 +192,31 @@ def send_message(character_id: int, message: str) -> Dict[str, Any]:
     Args:
         character_id: 目标角色 ID
         message:      玩家输入的消息文本
+        session_id:   可选，会话 ID。
+                       - None → 后端自动创建新会话（首条消息自动作为标题）
+                       - 有效 ID → 复用该会话累积多轮消息
 
     Returns:
         成功: ChatResponse dict
               {id, character_id, user_input, npc_response,
-               emotion, action, expression, director_raw, actor_raw, timestamp}
+               emotion, action, expression, director_raw, actor_raw, timestamp,
+               session_id, session_title}   ← 后两个为新增字段
         失败: {"error": True, "detail": "..."}
 
     为何使用 JSON body 而非 Form：
-      ChatRequest 是一个 Pydantic BaseModel（character_id + message），
+      ChatRequest 是一个 Pydantic BaseModel（character_id + message + session_id），
       后端通过请求体解析。requests.post(json=...) 自动设置
       Content-Type: application/json。
     """
+    payload: Dict[str, Any] = {
+        "character_id": character_id, "message": message,
+    }
+    if session_id is not None:
+        payload["session_id"] = session_id
     try:
         response = requests.post(
             _build_url(f"{API_PREFIX}/chat"),
-            json={"character_id": character_id, "message": message},
+            json=payload,
             timeout=TIMEOUT_SECONDS,
         )
         return _handle_response(response)
@@ -368,3 +381,390 @@ def check_backend_health() -> bool:
         return response.ok
     except (requests.ConnectionError, requests.Timeout):
         return False
+
+
+# ============================================================
+# LLM 设置 API (4 个端点)
+# ============================================================
+
+def get_llm_settings() -> Dict[str, Any]:
+    """
+    获取当前 LLM 设置。
+    端点: GET /api/settings/llm
+
+    Returns:
+        成功: {
+          active_provider, active_provider_name, config, providers,
+          default_temperature, default_max_tokens, settings_file_path
+        }
+        失败: {"error": True, "detail": "..."}
+    """
+    try:
+        response = requests.get(
+            _build_url(f"{API_PREFIX}/settings/llm"),
+            timeout=10,
+        )
+        return _handle_response(response)
+    except requests.ConnectionError:
+        return {"error": True, "detail": "无法连接后端，请确认 uvicorn 已启动在 :8000"}
+    except requests.Timeout:
+        return {"error": True, "detail": "请求设置超时"}
+
+
+def list_llm_providers() -> Dict[str, Any]:
+    """
+    列出所有支持的 LLM 厂商及其元信息。
+    端点: GET /api/settings/llm/providers
+
+    Returns:
+        成功: {"providers": [{id, name, needs_key}], "defaults": {provider_id: {base_url, model}}}
+        失败: {"error": True, "detail": "..."}
+    """
+    try:
+        response = requests.get(
+            _build_url(f"{API_PREFIX}/settings/llm/providers"),
+            timeout=10,
+        )
+        return _handle_response(response)
+    except requests.ConnectionError:
+        return {"error": True, "detail": "无法连接后端"}
+    except requests.Timeout:
+        return {"error": True, "detail": "请求超时"}
+
+
+def update_llm_settings(
+    active_provider: Optional[str] = None,
+    active_config: Optional[Dict[str, Optional[str]]] = None,
+    default_temperature: Optional[float] = None,
+    default_max_tokens: Optional[int] = None,
+) -> Dict[str, Any]:
+    """
+    更新 LLM 设置（部分更新友好）。
+    端点: PUT /api/settings/llm
+
+    Args:
+        active_provider:       要切换到的 provider id（None=不切换）
+        active_config:         当前激活 provider 的配置覆盖（None=不修改）
+                               形如 {"api_key": "sk-...", "base_url": "...", "model": "..."}
+        default_temperature:   新的默认温度
+        default_max_tokens:    新的默认 max_tokens
+
+    Returns:
+        成功: 更新后的完整设置（同 get_llm_settings 的响应）
+        失败: {"error": True, "detail": "..."}
+    """
+    payload: Dict[str, Any] = {}
+    if active_provider is not None:
+        payload["active_provider"] = active_provider
+    if active_config is not None:
+        # 过滤掉 None 字段，避免后端误以为是 "显式置空"
+        cleaned = {k: v for k, v in active_config.items() if v is not None}
+        if cleaned:
+            payload["active_config"] = cleaned
+    if default_temperature is not None:
+        payload["default_temperature"] = default_temperature
+    if default_max_tokens is not None:
+        payload["default_max_tokens"] = default_max_tokens
+
+    try:
+        response = requests.put(
+            _build_url(f"{API_PREFIX}/settings/llm"),
+            json=payload,
+            timeout=15,
+        )
+        return _handle_response(response)
+    except requests.ConnectionError:
+        return {"error": True, "detail": "无法连接后端"}
+    except requests.Timeout:
+        return {"error": True, "detail": "保存设置超时"}
+
+
+def test_llm_connection(
+    provider_id: Optional[str] = None,
+    api_key: Optional[str] = None,
+    base_url: Optional[str] = None,
+    model: Optional[str] = None,
+    test_prompt: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    测试 LLM 连接是否可用。
+    端点: POST /api/settings/llm/test
+
+    Args:
+        provider_id: 可选，覆盖当前激活 provider
+        api_key:     可选，本次测试用的 api_key（不写盘）
+        base_url:    可选，本次测试用的 base_url
+        model:       可选，本次测试用的 model
+        test_prompt: 可选，测试用的提示词
+
+    Returns:
+        成功/失败字典: {
+          success, message, provider_id, model,
+          response_text (成功时), latency_ms
+        }
+    """
+    payload: Dict[str, Any] = {}
+    if provider_id is not None:
+        payload["provider_id"] = provider_id
+    if api_key is not None:
+        payload["api_key"] = api_key
+    if base_url is not None:
+        payload["base_url"] = base_url
+    if model is not None:
+        payload["model"] = model
+    if test_prompt is not None:
+        payload["test_prompt"] = test_prompt
+
+    try:
+        response = requests.post(
+            _build_url(f"{API_PREFIX}/settings/llm/test"),
+            json=payload,
+            timeout=30,  # 测试调用应比正常聊天略宽裕
+        )
+        return _handle_response(response)
+    except requests.ConnectionError:
+        return {"error": True, "detail": "无法连接后端"}
+    except requests.Timeout:
+        return {"error": True, "detail": "测试请求超时（30s）"}
+
+
+# ============================================================
+# API 测试 API (3 个端点，移植自 web-tools/react-vite)
+# ============================================================
+
+def list_models(
+    provider_id: Optional[str] = None,
+    base_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    拉取 provider 的 /v1/models 列表（含耗时）。
+    端点: GET /api/test/models?provider_id=&base_url=&api_key=
+
+    Args:
+        provider_id: 可选，指定 provider；默认用当前激活
+        base_url:    可选，一次性覆盖 base_url
+        api_key:     可选，一次性覆盖 api_key
+
+    Returns:
+        成功: {
+          provider_id, base_url, models: [{id, owned_by, object}],
+          duration_ms, raw_count
+        }
+        失败: {"error": True, "detail": "..."}
+    """
+    params: Dict[str, Any] = {}
+    if provider_id:
+        params["provider_id"] = provider_id
+    if base_url:
+        params["base_url"] = base_url
+    if api_key:
+        params["api_key"] = api_key
+    try:
+        response = requests.get(
+            _build_url(f"{API_PREFIX}/test/models"),
+            params=params,
+            timeout=30,
+        )
+        return _handle_response(response)
+    except requests.ConnectionError:
+        return {"error": True, "detail": "无法连接后端"}
+    except requests.Timeout:
+        return {"error": True, "detail": "拉取 models 超时（30s）"}
+
+
+def test_latency(
+    provider_id: Optional[str] = None,
+    api_key: Optional[str] = None,
+    base_url: Optional[str] = None,
+    model: Optional[str] = None,
+    test_message: Optional[str] = "Hi",
+    max_tokens: int = 16,
+) -> Dict[str, Any]:
+    """
+    流式延迟测试（TTFT + 总延迟）。
+    端点: POST /api/test/latency (JSON body)
+
+    Returns:
+        成功: {
+          provider_id, model, status, ttft_ms, total_ms,
+          content, chunks, error
+        }
+        失败: {"error": True, "detail": "..."}
+
+    注意：test_message 与 max_tokens 仅在本测试中使用，不会写盘。
+    """
+    payload: Dict[str, Any] = {
+        "test_message": test_message,
+        "max_tokens": max_tokens,
+    }
+    if provider_id is not None:
+        payload["provider_id"] = provider_id
+    if api_key is not None:
+        payload["api_key"] = api_key
+    if base_url is not None:
+        payload["base_url"] = base_url
+    if model is not None:
+        payload["model"] = model
+    try:
+        response = requests.post(
+            _build_url(f"{API_PREFIX}/test/latency"),
+            json=payload,
+            timeout=90,  # 流式测试可能略长
+        )
+        return _handle_response(response)
+    except requests.ConnectionError:
+        return {"error": True, "detail": "无法连接后端"}
+    except requests.Timeout:
+        return {"error": True, "detail": "延迟测试超时（90s）"}
+
+
+def probe_llm(
+    provider_id: Optional[str] = None,
+    api_key: Optional[str] = None,
+    base_url: Optional[str] = None,
+    test_message: Optional[str] = "Hi",
+    max_tokens: int = 16,
+) -> Dict[str, Any]:
+    """
+    原始请求探针：返回完整 request/response 头/体（密钥已脱敏）。
+    端点: POST /api/test/probe (JSON body)
+    """
+    payload: Dict[str, Any] = {
+        "test_message": test_message,
+        "max_tokens": max_tokens,
+    }
+    if provider_id is not None:
+        payload["provider_id"] = provider_id
+    if api_key is not None:
+        payload["api_key"] = api_key
+    if base_url is not None:
+        payload["base_url"] = base_url
+    try:
+        response = requests.post(
+            _build_url(f"{API_PREFIX}/test/probe"),
+            json=payload,
+            timeout=30,
+        )
+        return _handle_response(response)
+    except requests.ConnectionError:
+        return {"error": True, "detail": "无法连接后端"}
+    except requests.Timeout:
+        return {"error": True, "detail": "探针请求超时（30s）"}
+
+
+# ============================================================
+# ChatSession API（5 个端点，移植自 NextChat 的会话管理）
+# ============================================================
+
+def list_sessions(
+    character_id: int,
+    search: Optional[str] = None,
+    limit: int = 100,
+    offset: int = 0,
+) -> List[Dict[str, Any]]:
+    """
+    列出某角色的全部会话（按 updated_at 倒序）。
+    端点: GET /api/sessions?character_id=&search=&limit=&offset=
+
+    Returns:
+        成功: [{id, character_id, title, created_at, updated_at, message_count}, ...]
+        失败: []
+    """
+    params: Dict[str, Any] = {
+        "character_id": character_id, "limit": limit, "offset": offset,
+    }
+    if search:
+        params["search"] = search
+    try:
+        response = requests.get(
+            _build_url(f"{API_PREFIX}/sessions"),
+            params=params,
+            timeout=10,
+        )
+        result = _handle_response(response)
+        if isinstance(result, list):
+            return result
+        return []
+    except (requests.ConnectionError, requests.Timeout):
+        return []
+
+
+def get_session_detail(session_id: int) -> Dict[str, Any]:
+    """
+    获取会话详情（含全部消息）。
+    端点: GET /api/sessions/{session_id}
+
+    Returns:
+        成功: {id, character_id, title, ..., message_count, messages: [...]}
+        失败: {"error": True, "detail": "..."}
+    """
+    try:
+        response = requests.get(
+            _build_url(f"{API_PREFIX}/sessions/{session_id}"),
+            timeout=10,
+        )
+        return _handle_response(response)
+    except requests.ConnectionError:
+        return {"error": True, "detail": "无法连接后端"}
+    except requests.Timeout:
+        return {"error": True, "detail": "加载会话超时"}
+
+
+def create_session(
+    character_id: int,
+    title: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    主动创建空会话（前端"新对话"按钮调用）。
+    端点: POST /api/sessions (JSON body)
+    """
+    payload: Dict[str, Any] = {"character_id": character_id}
+    if title:
+        payload["title"] = title
+    try:
+        response = requests.post(
+            _build_url(f"{API_PREFIX}/sessions"),
+            json=payload,
+            timeout=10,
+        )
+        return _handle_response(response)
+    except requests.ConnectionError:
+        return {"error": True, "detail": "无法连接后端"}
+    except requests.Timeout:
+        return {"error": True, "detail": "创建会话超时"}
+
+
+def rename_session(session_id: int, new_title: str) -> Dict[str, Any]:
+    """
+    重命名会话。
+    端点: PATCH /api/sessions/{session_id} (JSON body)
+    """
+    try:
+        response = requests.patch(
+            _build_url(f"{API_PREFIX}/sessions/{session_id}"),
+            json={"title": new_title},
+            timeout=10,
+        )
+        return _handle_response(response)
+    except requests.ConnectionError:
+        return {"error": True, "detail": "无法连接后端"}
+    except requests.Timeout:
+        return {"error": True, "detail": "重命名超时"}
+
+
+def delete_session(session_id: int) -> Dict[str, Any]:
+    """
+    删除会话（级联删除其下全部 conversation）。
+    端点: DELETE /api/sessions/{session_id}
+    """
+    try:
+        response = requests.delete(
+            _build_url(f"{API_PREFIX}/sessions/{session_id}"),
+            timeout=10,
+        )
+        return _handle_response(response)
+    except requests.ConnectionError:
+        return {"error": True, "detail": "无法连接后端"}
+    except requests.Timeout:
+        return {"error": True, "detail": "删除超时"}

@@ -85,6 +85,7 @@ class DirectorModule:
         current_state: Dict[str, Any],
         recent_memories: List[str],
         user_input: str,
+        history_messages: Optional[List[Dict[str, str]]] = None,
     ) -> Tuple[Dict[str, Any], str]:
         """
         执行注意力聚焦分析。
@@ -95,6 +96,11 @@ class DirectorModule:
             current_state:   当前状态字典（如 {"location": "酒馆", ...}）
             recent_memories: 最近记忆内容列表（字符串，最多5条）
             user_input:      玩家输入文本
+            history_messages: 可选的历史对话消息列表。
+                传入时启用多轮模式 ——
+                messages 数组会按 [system, ...history, current_user(prompt)] 顺序组装，
+                LLM 能感知完整对话上下文。
+                传 None 或空列表则回退到单轮（system + user）模式。
 
         Returns:
             (parsed_data, raw_response) 元组
@@ -128,12 +134,27 @@ class DirectorModule:
             "擅长根据上下文推导角色的心理状态和注意力焦点。"
         )
 
-        raw_response = self.llm_service.call(
-            prompt=prompt,
-            system_prompt=system_prompt,
-            temperature=0.5,
-            response_format={"type": "json_object"},
-        )
+        if history_messages:
+            # 多轮模式：system + 历史 user/assistant 交替 + 当前 user(prompt)
+            messages: List[Dict[str, str]] = [
+                {"role": "system", "content": system_prompt}
+            ]
+            messages.extend(history_messages)
+            messages.append({"role": "user", "content": prompt})
+
+            raw_response = self.llm_service.call_with_messages(
+                messages=messages,
+                temperature=0.5,
+                response_format={"type": "json_object"},
+            )
+        else:
+            # 单轮模式（向后兼容）
+            raw_response = self.llm_service.call(
+                prompt=prompt,
+                system_prompt=system_prompt,
+                temperature=0.5,
+                response_format={"type": "json_object"},
+            )
 
         # --- 步骤 3：解析并校验 ---
         parsed = self.llm_service.parse_json_response(raw_response)
@@ -148,12 +169,15 @@ class DirectorModule:
         current_state: Dict[str, Any],
         recent_memories: List[str],
         user_input: str,
+        history_messages: Optional[List[Dict[str, str]]] = None,
     ) -> Tuple[Dict[str, Any], Optional[str]]:
         """
         带降级的注意力分析。
 
         与 analyze() 的区别：捕获异常后不向上抛，而是返回降级值。
         这是管线中的"安全网"节点，确保 Director 的失败不会阻塞 Actor。
+
+        history_messages 透传给 analyze()，语义与 analyze() 一致。
 
         Returns:
             (parsed_data, raw_response_or_None)
@@ -164,6 +188,7 @@ class DirectorModule:
             return self.analyze(
                 character_name, personality, current_state,
                 recent_memories, user_input,
+                history_messages=history_messages,
             )
         except Exception as e:
             logger.warning(
@@ -209,6 +234,7 @@ class ActorModule:
         goal: str,
         style: str,
         user_input: str,
+        history_messages: Optional[List[Dict[str, str]]] = None,
     ) -> Tuple[Dict[str, Any], str]:
         """
         生成角色行为（动作 + 表情 + 语言）。
@@ -221,6 +247,11 @@ class ActorModule:
             goal:            Director 设定的对话目标
             style:           Director 确定的回复风格
             user_input:      玩家输入文本
+            history_messages: 可选的历史对话消息列表。
+                传入时启用多轮模式 ——
+                messages 数组会按 [system, ...history, current_user(prompt)] 顺序组装，
+                让 LLM 在生成回复时能感知到完整对话上下文（不仅是 Director 提供的摘要）。
+                传 None 或空列表则回退到单轮（system + user）模式。
 
         Returns:
             (parsed_data, raw_response) 元组
@@ -263,12 +294,27 @@ class ActorModule:
             "你能精准地根据角色的情绪、记忆和目标生成自然的动作和对话。"
         )
 
-        raw_response = self.llm_service.call(
-            prompt=prompt,
-            system_prompt=system_prompt,
-            temperature=0.8,
-            response_format={"type": "json_object"},
-        )
+        if history_messages:
+            # 多轮模式：system + 历史 user/assistant 交替 + 当前 user(prompt)
+            messages: List[Dict[str, str]] = [
+                {"role": "system", "content": system_prompt}
+            ]
+            messages.extend(history_messages)
+            messages.append({"role": "user", "content": prompt})
+
+            raw_response = self.llm_service.call_with_messages(
+                messages=messages,
+                temperature=0.8,
+                response_format={"type": "json_object"},
+            )
+        else:
+            # 单轮模式（向后兼容）
+            raw_response = self.llm_service.call(
+                prompt=prompt,
+                system_prompt=system_prompt,
+                temperature=0.8,
+                response_format={"type": "json_object"},
+            )
 
         # --- 步骤 3：解析并校验 ---
         parsed = self.llm_service.parse_json_response(raw_response)
@@ -285,9 +331,12 @@ class ActorModule:
         goal: str,
         style: str,
         user_input: str,
+        history_messages: Optional[List[Dict[str, str]]] = None,
     ) -> Tuple[Dict[str, Any], Optional[str]]:
         """
         带降级的行为生成。
+
+        history_messages 透传给 generate()，语义与 generate() 一致。
 
         Returns:
             (parsed_data, raw_response_or_None)
@@ -298,6 +347,7 @@ class ActorModule:
             return self.generate(
                 character_name, personality, emotion,
                 focus_memories, goal, style, user_input,
+                history_messages=history_messages,
             )
         except Exception as e:
             logger.warning(
@@ -353,19 +403,73 @@ class InteractionPipeline:
         except (json.JSONDecodeError, TypeError):
             return {}
 
+    @staticmethod
+    def _build_history_messages(
+        conversations: List[Any],
+        max_turns: int = 10,
+    ) -> List[Dict[str, str]]:
+        """
+        把数据库中最近 N 条对话记录组装为 OpenAI 风格的 messages 数组。
+
+        数据结构（OpenAI 格式）：
+            [
+              {"role": "user",      "content": <user_input>},
+              {"role": "assistant", "content": <npc_response>},
+              ... 交替 ...
+            ]
+
+        Args:
+            conversations: Conversation ORM 对象列表（按时间升序）。
+                          调用方需自行做"取最近 N 条"的截断。
+            max_turns: 最多保留多少轮（每轮 = 1 user + 1 assistant）。
+                       截断采用"保留最近 N 轮"策略：取列表尾部而非头部，
+                       避免最早的对话覆盖最近的语义。
+
+        Returns:
+            OpenAI 风格 messages 数组（不含 system，由调用方追加在最前）。
+            空列表表示无历史。
+
+        健壮性设计：
+          - 一轮对话必须 user_input *和* npc_response 都非空才保留。
+            原因：OpenAI messages 必须 user/assistant 严格交替，
+            若只保留一侧会导致连续同角色消息，触发 API 报错或语义混乱。
+          - 跳过"半轮"（任一字段为空）—— 在脏数据或部分写入失败时保护 LLM 调用。
+        """
+        if not conversations or max_turns <= 0:
+            return []
+
+        # 截断到最近 N 轮
+        recent = conversations[-max_turns:]
+
+        history: List[Dict[str, str]] = []
+        for conv in recent:
+            user_text = (conv.user_input or "").strip()
+            npc_text = (conv.npc_response or "").strip()
+            # 严格成对：两端都有非空内容才纳入 messages
+            if user_text and npc_text:
+                history.append({"role": "user", "content": user_text})
+                history.append({"role": "assistant", "content": npc_text})
+        return history
+
     def run(
         self,
         character_id: int,
         user_message: str,
         db: Session,
+        history_turns: int = 10,
+        session_id: Optional[int] = None,
     ) -> Dict[str, Any]:
         """
         运行完整的对话管线。
 
         Args:
-            character_id: 角色 ID
-            user_message: 玩家输入文本
-            db:           SQLAlchemy 数据库会话
+            character_id:  角色 ID
+            user_message:  玩家输入文本
+            db:            SQLAlchemy 数据库会话
+            history_turns: 注入到 LLM messages 的最近对话轮数。
+                           默认 10 轮 = 20 条消息；
+                           设为 0 即可禁用多轮模式（回退到单轮）。
+            session_id:    会话 ID（None → 自动创建新 session 并用首条消息做标题）
 
         Returns:
             字典，包含以下字段，可直接用于 ChatResponse schema：
@@ -380,6 +484,8 @@ class InteractionPipeline:
                 "director_raw": str|None,# Director LLM 原始响应
                 "actor_raw": str|None,   # Actor LLM 原始响应
                 "timestamp": datetime,
+                "session_id": int,       # 新增：所属会话
+                "session_title": str,    # 新增：会话标题（前端可立即更新侧栏）
             }
 
         Raises:
@@ -401,6 +507,41 @@ class InteractionPipeline:
         )
         memory_texts = [mem.content for mem in recent_memories]
 
+        # ---- 节点 2.4：获取/创建会话（多轮消息的容器） ----
+        #   - session_id 传了就复用（角色不匹配时降级为创建新 session）
+        #   - 没传就创建一个新 session，标题取首条消息前 30 字
+        #   - 必须在"取历史消息"之前完成，否则会把"上一会话"的内容串味到新会话
+        from backend.services import chat_session_crud
+        session = chat_session_crud.get_or_create_session(
+            db, session_id=session_id, character_id=character_id,
+            first_user_message=user_message,
+        )
+        session_id = session.id
+        session_title = session.title
+
+        # ---- 节点 2.5：组装多轮历史消息 ----
+        #   从当前 session 取最近 N 轮对话，按时间升序拼接为 OpenAI 风格 messages。
+        #   重要：必须在持久化新对话 *之前* 取历史，否则会把"当前轮"也塞回去造成重复。
+        history_messages: List[Dict[str, str]] = []
+        if history_turns and history_turns > 0:
+            # 优先用 session 级历史（更聚焦），但若 session 为空且没有显式 session_id
+            # 则退回到角色级历史，避免首次进入"默认会话"时空白
+            recent_conversations = conversation_crud.get_session_conversations(
+                db, session_id=session_id, limit=history_turns,
+            )
+            if not recent_conversations and session_id is None:
+                recent_conversations = conversation_crud.get_character_conversations(
+                    db, character_id, skip=0, limit=history_turns,
+                )
+            history_messages = self._build_history_messages(
+                recent_conversations, max_turns=history_turns,
+            )
+            if history_messages:
+                logger.info(
+                    "InteractionPipeline: 注入 %d 条历史消息（%d 轮）",
+                    len(history_messages), len(history_messages) // 2,
+                )
+
         # ---- 节点 3：执行 Director 注意力聚焦 ----
         # 使用带降级的版本，确保 LLM 失败时管线不崩溃
         director_data, director_raw = self.director.analyze_with_fallback(
@@ -409,6 +550,7 @@ class InteractionPipeline:
             current_state=current_state,
             recent_memories=memory_texts,
             user_input=user_message,
+            history_messages=history_messages or None,
         )
 
         # ---- 节点 4：执行 Actor 行为生成 ----
@@ -421,9 +563,10 @@ class InteractionPipeline:
             goal=director_data["goal"],
             style=director_data["style"],
             user_input=user_message,
+            history_messages=history_messages or None,
         )
 
-        # ---- 节点 5：持久化对话记录 ----
+        # ---- 节点 5：持久化对话记录（带 session_id） ----
         conversation = conversation_crud.create_conversation(
             db=db,
             character_id=character_id,
@@ -434,7 +577,11 @@ class InteractionPipeline:
             expression=actor_data["expression"],
             director_raw=director_raw,
             actor_raw=actor_raw,
+            session_id=session_id,
         )
+
+        # 刷新 session.updated_at，让活跃会话在侧栏里排前面
+        chat_session_crud.touch_session(db, session_id)
 
         # ---- 节点 6：返回结果 ----
         return {
@@ -448,4 +595,6 @@ class InteractionPipeline:
             "director_raw": director_raw,
             "actor_raw": actor_raw,
             "timestamp": conversation.timestamp,
+            "session_id": session_id,
+            "session_title": session_title,
         }

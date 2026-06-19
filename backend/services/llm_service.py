@@ -2,28 +2,28 @@ import json
 import logging
 import re
 import time
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from urllib.parse import urlparse
 
 from openai import OpenAI, APIError, APIConnectionError, RateLimitError, AuthenticationError
 
 from backend.config import settings
+from backend.services.llm_settings_store import LLMSettingsStore
 
 logger = logging.getLogger(__name__)
 
 
 class LLMService:
-    """LLM服务封装类 - 支持多模型切换
+    """LLM服务封装类 - 支持多模型切换 + 运行时热更新
 
-    支持的模型厂商:
-    - deepseek: DeepSeek API
-    - qwen: 通义千问 (阿里云)
-    - zhipu: 智谱 GLM
-    - ollama: 本地 Ollama
-    - openai: OpenAI GPT
+    配置来源（优先级从高到低）：
+      1. usercontext/llm_settings.json （由设置页写入）
+      2. 环境变量（向后兼容老配置，API_KEY / *_BASE_URL / *_MODEL）
 
-    使用方式:
-    在 .env 文件中设置 LLM_PROVIDER=厂商名，并配置对应的 API_KEY
+    行为：
+      - 每次 __init__ 都会从 LLMSettingsStore 重新读取配置
+        ——保证设置页改动后，下一次对话/角色创建即可生效，**无需重启后端**。
+      - 内部维护 self._loaded_at 时间戳；可在外部调用 reload_config() 强制重读。
     """
 
     _MAX_RETRIES = 3
@@ -31,22 +31,65 @@ class LLMService:
     _TIMEOUT = 60
 
     def __init__(self):
-        llm_config = settings.get_llm_config()
+        self.reload_config()
 
-        if not llm_config["api_key"] and settings.LLM_PROVIDER != "ollama":
-            raise ValueError(f"{settings.LLM_PROVIDER.upper()}_API_KEY 未配置，请检查 .env 文件")
+    def reload_config(self) -> None:
+        """
+        从 LLMSettingsStore 重新加载配置，并重建 OpenAI client。
 
-        self._validate_base_url(llm_config["base_url"])
+        调用场景：
+          - __init__ 内部（默认）
+          - 设置页 PUT 成功后由 main.py 显式调用
+            （不显式调用也行——下次 chat 请求时会自动重读）
+        """
+        store = LLMSettingsStore()
+        provider_id = store.get_active_provider_id()
+        # get_provider_with_env_fallback 自动从环境变量补齐缺失字段
+        # （向后兼容老的 .env 配置）
+        cfg = store.get_provider_with_env_fallback(provider_id)
 
+        api_key = cfg.get("api_key", "") or ""
+        base_url = cfg.get("base_url", "")
+        model = cfg.get("model", "")
+
+        # 校验
+        if not api_key and provider_id != "ollama":
+            raise ValueError(
+                f"provider={provider_id} 的 API Key 为空。"
+                f"请在设置页填写，或在 .env 中设置 {provider_id.upper()}_API_KEY"
+            )
+        if not base_url:
+            raise ValueError(f"provider={provider_id} 的 base_url 为空")
+        if not model:
+            raise ValueError(f"provider={provider_id} 的 model 为空")
+
+        self._validate_base_url(base_url)
+
+        self.provider = provider_id
+        self.model = model
+        self.base_url = base_url
+        self._api_key = api_key
         self.client = OpenAI(
-            api_key=llm_config["api_key"],
-            base_url=llm_config["base_url"],
-            timeout=self._TIMEOUT
+            api_key=api_key if provider_id != "ollama" else "ollama",
+            base_url=base_url,
+            timeout=self._TIMEOUT,
         )
-        self.model = llm_config["model"]
-        self.provider = settings.LLM_PROVIDER
+        self._loaded_at = time.time()
+        logger.info(
+            "LLMService 重新加载: provider=%s, model=%s, base_url=%s",
+            self.provider, self.model, self.base_url,
+        )
 
-        logger.info(f"LLMService initialized: provider={self.provider}, model={self.model}")
+    @staticmethod
+    def _try_env_fallback(provider_id: str, suffix: str) -> Optional[str]:
+        """
+        从环境变量回退读取（仅当 JSON 文件里没值时使用）。
+        兼容 .env 中形如 AGNES_API_KEY / DEEPSEEK_API_KEY / QWEN_BASE_URL 等命名。
+        保留为 @staticmethod 以便其他场景使用；reload_config 主路径已统一走 store。
+        """
+        import os
+        env_name = f"{provider_id.upper()}_{suffix}"
+        return os.environ.get(env_name) or None
 
     def _validate_base_url(self, base_url: str) -> None:
         """校验 base_url 格式合法性"""
@@ -71,7 +114,7 @@ class LLMService:
         response_format: Optional[dict] = None
     ) -> str:
         """
-        调用LLM
+        调用LLM（单轮：system + user）
 
         Args:
             prompt: 用户prompt
@@ -102,6 +145,89 @@ class LLMService:
         if response_format is not None:
             kwargs["response_format"] = response_format
 
+        return self._call_with_retry(kwargs)
+
+    def call_with_messages(
+        self,
+        messages: List[Dict[str, str]],
+        temperature: float = 0.7,
+        max_tokens: int = 1000,
+        response_format: Optional[dict] = None
+    ) -> str:
+        """
+        使用已组装好的多轮 messages 数组调用 LLM。
+
+        与 call() 的区别：
+          - call()          只能传单条 prompt，自动拼成 [system?, user]
+          - call_with_messages() 接受调用方已组装好的完整消息列表，
+                                  支持多轮对话上下文（system + 历史 user/assistant + 当前 user）
+
+        Args:
+            messages: 已组装的消息数组，每个元素必须是 {"role": ..., "content": ...}
+                      至少包含 1 条消息；role 必须是 system/user/assistant 之一
+            temperature: 温度参数（0-2）
+            max_tokens: 最大token数（1-32000）
+            response_format: 响应格式约束（可选）
+
+        Returns:
+            LLM的响应文本
+
+        Raises:
+            ValueError: 参数非法时
+        """
+        # --- 校验 messages ---
+        if not isinstance(messages, list) or not messages:
+            raise ValueError("messages 必须是非空列表")
+
+        valid_roles = {"system", "user", "assistant"}
+        validated: List[Dict[str, str]] = []
+        for idx, msg in enumerate(messages):
+            if not isinstance(msg, dict):
+                raise ValueError(f"messages[{idx}] 必须是字典")
+            role = msg.get("role")
+            content = msg.get("content")
+            if role not in valid_roles:
+                raise ValueError(
+                    f"messages[{idx}].role 必须是 {valid_roles} 之一，得到 {role!r}"
+                )
+            if not isinstance(content, str):
+                raise ValueError(f"messages[{idx}].content 必须是字符串")
+            validated.append({"role": role, "content": content})
+
+        # --- 校验其他参数 ---
+        if not isinstance(temperature, (int, float)):
+            raise ValueError("temperature 必须是数值")
+        if temperature < 0 or temperature > 2:
+            raise ValueError("temperature 必须在 [0, 2] 范围内")
+        if not isinstance(max_tokens, int):
+            raise ValueError("max_tokens 必须是整数")
+        if max_tokens < 1 or max_tokens > 32000:
+            raise ValueError("max_tokens 必须在 [1, 32000] 范围内")
+
+        kwargs = dict(
+            model=self.model,
+            messages=validated,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        if response_format is not None:
+            kwargs["response_format"] = response_format
+
+        logger.debug(
+            "call_with_messages: total=%d, history_turns=%d",
+            len(validated),
+            sum(1 for m in validated if m["role"] in ("user", "assistant")) // 2,
+        )
+        return self._call_with_retry(kwargs)
+
+    def _call_with_retry(self, kwargs: Dict[str, Any]) -> str:
+        """
+        执行带重试的 LLM 调用（被 call / call_with_messages 共用）。
+
+        抽离此方法的动机：
+          - call 与 call_with_messages 的重试/异常处理逻辑完全一致
+          - 集中一处便于未来统一调整重试策略（如指数退避、熔断等）
+        """
         last_exception = None
         for attempt in range(self._MAX_RETRIES):
             try:
@@ -139,6 +265,9 @@ class LLMService:
 
         if last_exception:
             raise last_exception
+
+        # 理论上不会到达这里（每次循环要么 return 要么 continue 要么 raise）
+        raise RuntimeError("LLM调用异常结束：未返回结果也未抛出异常")
 
     def _validate_call_params(
         self,

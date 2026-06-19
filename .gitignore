@@ -1,61 +1,43 @@
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-*.egg
-*.egg-info/
-dist/
-build/
-.eggs/
-*.pyc
-
-# Virtual environments
-.venv/
-venv/
-env/
-ENV/
-
-# Environment
+# ===== 敏感配置 =====
 .env
-.env.local
-.env.*.local
+.env.*
+!.env.example
 
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-.DS_Store
+# ===== 运行时数据 =====
+data/
+usercontext/
 
-# Logs
+# ===== 参考项目（不纳入版本控制）=====
+refproj/
+
+# ===== 日志 =====
 *.log
 backend_stderr.log
 backend_stdout.log
+frontend/frontend_stderr.log
+frontend/frontend_stdout.log
 
-# Database
-*.db
-*.db-journal
-*.sqlite
-*.sqlite3
+# ===== Python 缓存 =====
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+TraeAI-*/
 
-# Data
-data/character_seed.db
-data/knowledge_base/
-data/long_term_memory/
+# ===== IDE / 编辑器 =====
+.idea/
+.vscode/
+*.swp
+*.swo
 
-# Test artifacts
-.pytest_cache/
-htmlcov/
-.coverage
-.coverage.*
-coverage.xml
-*.cover
+# ===== 操作系统 =====
+.DS_Store
+Thumbs.db
 
-# Codebuddy
-.codebuddy/
-
-# Refproj
-refproj/
+# ===== 临时文档 =====
+doc/todo.md
