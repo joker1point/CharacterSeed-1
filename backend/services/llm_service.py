@@ -5,6 +5,11 @@ import time
 from typing import Optional, Dict, Any, List
 from urllib.parse import urlparse
 
+# Langfuse 可观测性集成（参考 https://juejin.cn/post/7633462423300407336）
+# 设计：observability.get_openai_class() 在 Langfuse 启用时返回 langfuse.openai.OpenAI，
+# 否则返回原生 openai.OpenAI。LLMService 本身不感知 Langfuse 存在与否。
+from backend.services.observability import get_openai_class, is_enabled as _lf_enabled
+
 from openai import OpenAI, APIError, APIConnectionError, RateLimitError, AuthenticationError
 
 from backend.config import settings
@@ -69,15 +74,19 @@ class LLMService:
         self.model = model
         self.base_url = base_url
         self._api_key = api_key
-        self.client = OpenAI(
+        # OpenAI 类可能是 langfuse.openai.OpenAI（wrap 后自动生成 generation 记录）
+        # 也可能是原生 openai.OpenAI（Langfuse 未启用）。LLMService 对此无感。
+        self.OpenAI = get_openai_class()
+        self.client = self.OpenAI(
             api_key=api_key if provider_id != "ollama" else "ollama",
             base_url=base_url,
             timeout=self._TIMEOUT,
         )
         self._loaded_at = time.time()
+        langfuse_tag = " (langfuse=on)" if _lf_enabled() else ""
         logger.info(
-            "LLMService 重新加载: provider=%s, model=%s, base_url=%s",
-            self.provider, self.model, self.base_url,
+            "LLMService 重新加载: provider=%s, model=%s, base_url=%s%s",
+            self.provider, self.model, self.base_url, langfuse_tag,
         )
 
     @staticmethod
